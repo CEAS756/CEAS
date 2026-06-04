@@ -1,30 +1,55 @@
 # 🤖 CEAS REACTION Bot
 
-A Discord bot that auto-reacts when someone gets pinged — fully configurable **inside Discord** with no coding needed.
+Auto-reacts when someone gets pinged. Choose exactly WHO gets reactions, with any emoji including custom and Nitro animated ones.
 
 ---
 
 ## ✨ Features
 
-| Feature | Description |
+| Command | What it does |
 |---|---|
-| 🔔 **Auto-react on ping** | Reacts with emojis whenever someone is @mentioned |
-| 🎛️ **`/panel`** | Control panel — all settings in one place |
-| 📄 **`/settings`** | View current configuration |
-| 🔔 **`/setreactions`** | Change reaction emojis without touching code |
-| 🔁 **`/togglereactions`** | Enable/disable auto-reactions |
-| 👋 **`/setwelcome`** | Set a welcome channel |
-| ✏️ **`/setwelcomemsg`** | Customize welcome message |
-| 📋 **`/setlog`** | Set a log channel for bot actions |
-| ⚙️ **`/setprefix`** | Change command prefix |
-| 🏓 **`/ping`** | Bot latency |
-| 👤 **`/userinfo`** | Member info |
-| 🏠 **`/serverinfo`** | Server stats |
-| 🖼️ **`/avatar`** | User avatar |
-| 💬 **`/say`** | Bot sends a message |
-| 🗑️ **`/clear`** | Delete messages |
+| `/panel` | Full control panel overview |
+| `/settings` | View current config |
+| `/setreactions` | Set reaction emojis (standard, custom, Nitro) |
+| `/togglereactions` | Turn auto-reactions on/off |
+| `/addtarget @user` | Only react when THIS person is pinged |
+| `/removetarget @user` | Remove from target list |
+| `/targets` | View target list |
+| `/cleartargets` | React to all pings again |
+| `/ping` | Bot latency |
+| `/help` | All commands |
 
-> **All config commands require the "Manage Server" permission — regular members can't change settings.**
+> **Config commands require "Manage Server" permission.**
+
+---
+
+## 🎨 Custom & Nitro Emojis in /setreactions
+
+You can use **any emoji type**:
+
+| Type | How to input |
+|---|---|
+| Standard emoji | Just paste it: `👀 ✅ 🔥` |
+| Custom server emoji | Type `<:name:ID>` e.g. `<:pogchamp:123456789>` |
+| Animated / Nitro emoji | Type `<a:name:ID>` e.g. `<a:dance:987654321>` |
+
+**How to get a custom emoji ID on Discord:**
+1. Type `\:emojiname:` in any chat
+2. Discord shows the raw ID like `<:name:123456789>`
+3. Copy that and paste it into `/setreactions`
+
+> Note: The bot can only react with custom emojis from servers it is in, or animated emojis if it has Nitro. For server emojis, invite the bot to the server that has those emojis.
+
+---
+
+## 🎯 Targeting — React to specific people only
+
+By default the bot reacts to **all pings**. Use `/addtarget` to restrict it:
+
+- `/addtarget @John` → only react when John is pinged
+- `/addtarget @Sarah` → also react when Sarah is pinged
+- `/removetarget @John` → remove John
+- `/cleartargets` → go back to reacting to everyone
 
 ---
 
@@ -34,88 +59,46 @@ A Discord bot that auto-reacts when someone gets pinged — fully configurable *
 
 1. Go to [discord.com/developers/applications](https://discord.com/developers/applications)
 2. Click **New Application** → name it `CEAS REACTION`
-3. Go to **General Information** → copy your **Application ID** (you'll need this)
-4. Go to the **Bot** tab → click **Reset Token** → copy your **Bot Token**
-5. Under **Privileged Gateway Intents**, enable:
-   - ✅ **Server Members Intent**
-   - ✅ **Message Content Intent**
-6. Go to **OAuth2 → URL Generator**
+3. **General Information** → copy your **Application ID**
+4. **Bot** tab → **Reset Token** → copy your **Bot Token**
+5. Enable under **Privileged Gateway Intents**:
+   - ✅ Server Members Intent
+   - ✅ Message Content Intent
+6. **OAuth2 → URL Generator**
    - Scopes: ✅ `bot` ✅ `applications.commands`
-   - Bot Permissions: `Send Messages`, `Read Messages`, `Add Reactions`, `Manage Messages`, `Read Message History`
-7. Open the generated URL → invite the bot to your server
+   - Permissions: `Send Messages`, `Read Messages`, `Add Reactions`, `Read Message History`
+7. Open generated URL → invite bot to your server
 
 ---
 
 ### Option A — Run Locally
 
 ```bash
-# 1. Extract this ZIP and open the folder
 cd ceas-reaction-bot
-
-# 2. Install dependencies
 npm install
-
-# 3. Set up your config
 cp .env.example .env
-# Open .env and fill in DISCORD_TOKEN and CLIENT_ID
-
-# 4. Start the bot
+# Edit .env — add DISCORD_TOKEN and CLIENT_ID
 npm start
 ```
 
----
+### Option B — Railway (free, always online)
 
-### Option B — Deploy on Railway (free, always online)
-
-1. Push this folder to a **GitHub repository**
-2. Go to [railway.app](https://railway.app) → sign in with GitHub
-3. Click **New Project → Deploy from GitHub repo** → select your repo
-4. Go to the **Variables** tab and add:
+1. Upload folder to a GitHub repo
+2. [railway.app](https://railway.app) → New Project → Deploy from GitHub
+3. Add Variables:
    - `DISCORD_TOKEN` → your bot token
    - `CLIENT_ID` → your Application ID
-   - `PREFIX` → `!`
-5. Railway deploys automatically — bot is live! ✅
+4. Deploy — done ✅
 
 ---
 
-## ⚙️ Configuration (inside Discord — no coding!)
-
-Once the bot is online, admins can configure everything with slash commands:
-
-| Command | What it does |
-|---|---|
-| `/panel` | Opens the full control panel |
-| `/setreactions 👀,✅,🔔` | Change ping reaction emojis |
-| `/togglereactions` | Turn auto-reactions on/off |
-| `/setwelcome #channel` | Set welcome channel |
-| `/setwelcomemsg Welcome {user}!` | Customize welcome text |
-| `/disablewelcome` | Turn off welcome messages |
-| `/setlog #channel` | Set log channel |
-| `/setprefix ?` | Change command prefix |
-| `/settings` | View all current settings |
-
-**Welcome message placeholders:**
-- `{user}` → @mentions the new member
-- `{server}` → server name
-- `{count}` → current member count
-
----
-
-## 📁 File Structure
+## 📁 Files
 
 ```
-ceas-reaction-bot/
-├── index.js          # Main bot code
-├── settings.json     # Auto-created — stores per-server settings
-├── package.json      # Dependencies
-├── .env.example      # Config template
-├── .env              # Your actual config (never share this!)
-├── .gitignore        # Keeps .env and node_modules out of git
-├── Procfile          # Railway/Heroku process file
-├── railway.json      # Railway deployment config
-└── README.md         # This file
+index.js        — Bot code
+settings.json   — Auto-created, stores per-server settings
+package.json    — Dependencies
+.env.example    — Config template (rename to .env locally)
+railway.json    — Railway config
+Procfile        — Process file
 ```
-
----
-
-Made with ❤️ using [discord.js v14](https://discord.js.org/)
