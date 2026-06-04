@@ -20,7 +20,7 @@ function getGuild(guildId) {
   if (!all[guildId]) {
     all[guildId] = {
       reactionsEnabled: true,
-      pingReactions: ['👀', '✅', '🔔'],
+      pingReactions: [],
       targetUserIds: [],
     };
     saveSettings(all);
@@ -48,57 +48,57 @@ const client = new Client({
 const commands = [
   new SlashCommandBuilder()
     .setName('panel')
-    .setDescription('🎛️ Open the bot control panel')
+    .setDescription('Open the bot control panel')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName('settings')
-    .setDescription('📄 View current bot settings')
+    .setDescription('View current bot settings')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName('setreactions')
-    .setDescription('🔔 Set emojis to react with when someone is pinged')
+    .setDescription('Set emojis to react with when someone is pinged')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o =>
       o.setName('emojis')
-        .setDescription('Emojis separated by spaces. Standard: 👀 Custom: paste <:name:ID> or <a:name:ID>')
+        .setDescription('Paste your emojis here separated by spaces')
         .setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('togglereactions')
-    .setDescription('🔁 Enable or disable auto-reactions')
+    .setDescription('Enable or disable auto-reactions')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName('addtarget')
-    .setDescription('🎯 Only react when THIS user is pinged (leave empty = react to everyone)')
+    .setDescription('Only react when this user is pinged')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addUserOption(o => o.setName('user').setDescription('User to target').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('removetarget')
-    .setDescription('❌ Remove a user from the target list')
+    .setDescription('Remove a user from the target list')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addUserOption(o => o.setName('user').setDescription('User to remove').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('targets')
-    .setDescription('📋 View the current target user list')
+    .setDescription('View the current target user list')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName('cleartargets')
-    .setDescription('🔄 Clear target list — react to ALL pings again')
+    .setDescription('Clear target list and react to all pings again')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName('ping')
-    .setDescription('🏓 Check bot latency'),
+    .setDescription('Check bot latency'),
 
   new SlashCommandBuilder()
     .setName('help')
-    .setDescription('📖 Show all commands'),
+    .setDescription('Show all commands'),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
