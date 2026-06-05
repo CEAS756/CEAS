@@ -1,14 +1,13 @@
 require('dotenv').config();
 const {
   Client, GatewayIntentBits, Partials, EmbedBuilder,
-  REST, Routes, SlashCommandBuilder, PermissionFlagsBits,
+  REST, Routes, SlashCommandBuilder, PermissionFlagsBits, ChannelType,
 } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
 
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 
-// ── Default mood rules ────────────────────────────────────────────────────────
 const DEFAULT_MOODS = [
   { keyword: 'happy birthday', emojis: ['🎂', '🎉', '🎈'] },
   { keyword: 'hbd', emojis: ['🎂', '🎉'] },
@@ -33,114 +32,136 @@ const DEFAULT_MOODS = [
   { keyword: 'pog', emojis: ['😮', '🔥'] },
   { keyword: 'based', emojis: ['💪', '😤'] },
   { keyword: 'cringe', emojis: ['💀', '😬'] },
-  { keyword: 'w', emojis: ['🏆', '💪'] },
-  { keyword: 'l', emojis: ['💀', '📉'] },
 ];
 
 // ── Persistence ───────────────────────────────────────────────────────────────
-function loadSettings() {
+function load() {
   if (!fs.existsSync(SETTINGS_FILE)) return {};
   try { return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch { return {}; }
 }
-function saveSettings(data) {
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2));
-}
+function save(data) { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2)); }
 function getGuild(guildId) {
-  const all = loadSettings();
+  const all = load();
   if (!all[guildId]) all[guildId] = {};
   const g = all[guildId];
   const defaults = {
-    reactionsEnabled: true,
-    defaultReactions: [],
-    userReactions: {},
+    on: true,
+    random: false,
+    defaultEmojis: [],
+    userEmojis: {},
+    roleEmojis: {},
     reactionRoles: [],
-    randomMode: false,
-    pingCooldownSeconds: {},
-    lastPingTime: {},
-    ghostPingEnabled: false,
-    ghostPingChannelId: null,
+    mood: false,
+    automood: false,
+    moods: JSON.parse(JSON.stringify(DEFAULT_MOODS)),
+    ghost: false,
+    ghostLog: null,
     pingCounts: {},
-    pingMilestoneChannelId: null,
-    moodReactionsEnabled: false,
-    autoMoodEnabled: false,
-    moodRules: JSON.parse(JSON.stringify(DEFAULT_MOODS)),
-    shieldedUsers: [],
-    shieldAlertChannelId: null,
+    milestoneLog: null,
+    cooldowns: {},
+    lastPing: {},
+    shields: [],
+    shieldLog: null,
+    blocked: [],
+    hoursStart: null,
+    hoursEnd: null,
   };
   for (const [k, v] of Object.entries(defaults)) {
     if (g[k] === undefined) g[k] = typeof v === 'object' && v !== null ? JSON.parse(JSON.stringify(v)) : v;
   }
   all[guildId] = g;
-  saveSettings(all);
+  save(all);
   return g;
 }
 function setGuild(guildId, data) {
-  const all = loadSettings();
+  const all = load();
   all[guildId] = { ...getGuild(guildId), ...data };
-  saveSettings(all);
+  save(all);
   return all[guildId];
 }
 
 // ── Emoji helpers ─────────────────────────────────────────────────────────────
-function parseOneEmoji(raw) {
-  const custom = raw.match(/<a?:(\w+):(\d+)>/);
-  if (custom) return custom[2];
-  const unicode = raw.match(/\p{Emoji_Presentation}|\p{Emoji}\uFE0F/u);
-  if (unicode) return unicode[0];
-  return null;
+function one(raw) {
+  const c = raw.match(/<a?:(\w+):(\d+)>/);
+  if (c) return c[2];
+  const u = raw.match(/\p{Emoji_Presentation}|\p{Emoji}\uFE0F/u);
+  return u ? u[0] : null;
 }
-function parseManyEmojis(raw) {
-  const results = [];
-  const customRegex = /<a?:\w+:(\d+)>/g;
+function many(raw) {
+  const r = [];
+  const re = /<a?:\w+:(\d+)>/g;
   let m;
-  while ((m = customRegex.exec(raw)) !== null) results.push(m[1]);
-  const noCustom = raw.replace(/<a?:\w+:\d+>/g, '');
-  const unicodeMatches = noCustom.match(/\p{Emoji_Presentation}|\p{Emoji}\uFE0F/gu);
-  if (unicodeMatches) results.push(...unicodeMatches);
-  return [...new Set(results)];
+  while ((m = re.exec(raw)) !== null) r.push(m[1]);
+  const u = raw.replace(/<a?:\w+:\d+>/g, '').match(/\p{Emoji_Presentation}|\p{Emoji}\uFE0F/gu);
+  if (u) r.push(...u);
+  return [...new Set(r)];
 }
-function emojiDisplay(e) { return isNaN(e) ? e : `<:_:${e}>`; }
-function emojiKey(emoji) { return emoji.id || emoji.name; }
+function disp(e) { return isNaN(e) ? e : `<:_:${e}>`; }
+function ekey(emoji) { return emoji.id || emoji.name; }
 
-// ── Mood helpers ──────────────────────────────────────────────────────────────
-function getMoodEmojis(moodRules, content) {
+// ── Mood ──────────────────────────────────────────────────────────────────────
+function moodMatch(moods, content) {
   const lower = content.toLowerCase();
-  for (const rule of moodRules) {
-    if (lower.includes(rule.keyword.toLowerCase())) return rule.emojis;
+  for (const r of moods) {
+    if (lower.includes(r.keyword.toLowerCase())) return r.emojis;
   }
   return null;
 }
 
-// ── Ping reaction helpers ─────────────────────────────────────────────────────
-function pickEmojis(cfg, userId, messageContent) {
-  if (cfg.moodReactionsEnabled) {
-    const mood = getMoodEmojis(cfg.moodRules, messageContent);
+// ── Hours check ───────────────────────────────────────────────────────────────
+function inHours(cfg) {
+  if (cfg.hoursStart === null || cfg.hoursEnd === null) return true;
+  const hour = new Date().getUTCHours();
+  if (cfg.hoursStart <= cfg.hoursEnd) return hour >= cfg.hoursStart && hour < cfg.hoursEnd;
+  return hour >= cfg.hoursStart || hour < cfg.hoursEnd;
+}
+
+// ── Pick emojis ───────────────────────────────────────────────────────────────
+function pickEmojis(cfg, userId, memberRoles, content) {
+  if (cfg.mood) {
+    const mood = moodMatch(cfg.moods, content);
     if (mood) return mood;
   }
-  const userEmojis = cfg.userReactions[userId] || [];
-  const pool = userEmojis.length ? userEmojis : cfg.defaultReactions;
-  if (!pool.length) return [];
-  return cfg.randomMode ? [pool[Math.floor(Math.random() * pool.length)]] : pool;
+  if (cfg.userEmojis[userId]?.length) {
+    return cfg.random
+      ? [cfg.userEmojis[userId][Math.floor(Math.random() * cfg.userEmojis[userId].length)]]
+      : cfg.userEmojis[userId];
+  }
+  if (memberRoles) {
+    for (const roleId of memberRoles) {
+      if (cfg.roleEmojis[roleId]?.length) {
+        return cfg.random
+          ? [cfg.roleEmojis[roleId][Math.floor(Math.random() * cfg.roleEmojis[roleId].length)]]
+          : cfg.roleEmojis[roleId];
+      }
+    }
+  }
+  if (!cfg.defaultEmojis.length) return [];
+  return cfg.random
+    ? [cfg.defaultEmojis[Math.floor(Math.random() * cfg.defaultEmojis.length)]]
+    : cfg.defaultEmojis;
 }
 
-function checkCooldown(cfg, userId) {
-  const cd = cfg.pingCooldownSeconds[userId];
+// ── Cooldown ──────────────────────────────────────────────────────────────────
+function canReact(cfg, userId) {
+  const cd = cfg.cooldowns[userId];
   if (!cd) return true;
-  return (Date.now() - (cfg.lastPingTime[userId] || 0)) / 1000 >= cd;
+  return (Date.now() - (cfg.lastPing[userId] || 0)) / 1000 >= cd;
 }
-function updateCooldown(cfg, guildId, userId) {
-  cfg.lastPingTime[userId] = Date.now();
-  setGuild(guildId, { lastPingTime: cfg.lastPingTime });
+function stampCooldown(cfg, guildId, userId) {
+  cfg.lastPing[userId] = Date.now();
+  setGuild(guildId, { lastPing: cfg.lastPing });
 }
 
+// ── Milestones ────────────────────────────────────────────────────────────────
 const MILESTONES = [10, 25, 50, 100, 250, 500, 1000];
-async function incrementPingCount(cfg, guildId, guild, userId) {
+async function trackPing(cfg, guildId, guild, userId) {
   cfg.pingCounts[userId] = (cfg.pingCounts[userId] || 0) + 1;
-  const count = cfg.pingCounts[userId];
+  const n = cfg.pingCounts[userId];
   setGuild(guildId, { pingCounts: cfg.pingCounts });
-  if (cfg.pingMilestoneChannelId && MILESTONES.includes(count)) {
-    const ch = guild.channels.cache.get(cfg.pingMilestoneChannelId);
-    if (ch) await ch.send({ embeds: [new EmbedBuilder().setColor(0xFFD700).setTitle('🏅 Ping Milestone!').setDescription(`<@${userId}> has been pinged **${count} times** in this server!`).setTimestamp()] }).catch(() => {});
+  if (cfg.milestoneLog && MILESTONES.includes(n)) {
+    const ch = guild.channels.cache.get(cfg.milestoneLog);
+    if (ch) await ch.send({ embeds: [new EmbedBuilder().setColor(0xFFD700).setTitle('🏅 Ping Milestone!').setDescription(`<@${userId}> has been pinged **${n} times**!`).setTimestamp()] }).catch(() => {});
   }
 }
 
@@ -156,111 +177,137 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.GuildMember],
 });
 
-// ── Commands ──────────────────────────────────────────────────────────────────
-const ADMIN = PermissionFlagsBits.ManageGuild;
+const A = PermissionFlagsBits.ManageGuild;
 const commands = [
-  // Info
-  new SlashCommandBuilder().setName('panel').setDescription('Open the full control panel').setDefaultMemberPermissions(ADMIN),
-  new SlashCommandBuilder().setName('help').setDescription('Browse all commands by category').addStringOption(o => o.setName('category').setDescription('Category to view').setChoices(
-    { name: '📋 All', value: 'all' },
-    { name: '🔔 Reactions', value: 'reactions' },
-    { name: '🎭 Mood', value: 'mood' },
-    { name: '🎯 Reaction Roles', value: 'roles' },
-    { name: '👻 Ghost Ping', value: 'ghost' },
-    { name: '📊 Leaderboard', value: 'leaderboard' },
-    { name: '🛡️ Shield', value: 'shield' },
-    { name: '⚙️ Settings', value: 'settings' },
-  )),
-  new SlashCommandBuilder().setName('settings').setDescription('View all current bot settings').setDefaultMemberPermissions(ADMIN),
+  // ── Core ─────────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('panel').setDescription('Open the control panel').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('settings').setDescription('View current settings').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('help').setDescription('Browse commands by category')
+    .addStringOption(o => o.setName('category').setDescription('Category').setChoices(
+      { name: 'All', value: 'all' }, { name: 'Reactions', value: 'reactions' },
+      { name: 'Mood', value: 'mood' }, { name: 'Reaction Roles', value: 'rr' },
+      { name: 'Ghost Ping', value: 'ghost' }, { name: 'Leaderboard', value: 'lb' },
+      { name: 'Shield & Block', value: 'shield' }, { name: 'Other', value: 'other' },
+    )),
   new SlashCommandBuilder().setName('ping').setDescription('Check bot latency'),
 
-  // Core reactions
-  new SlashCommandBuilder().setName('togglereactions').setDescription('Enable or disable all auto-reactions').setDefaultMemberPermissions(ADMIN),
-  new SlashCommandBuilder().setName('togglerandom').setDescription('Random mode — picks ONE random emoji per ping instead of all').setDefaultMemberPermissions(ADMIN),
-  new SlashCommandBuilder().setName('setdefault').setDescription('Replace all default reaction emojis').setDefaultMemberPermissions(ADMIN).addStringOption(o => o.setName('emojis').setDescription('Paste emojis separated by spaces').setRequired(true)),
-  new SlashCommandBuilder().setName('adddefault').setDescription('Add one emoji to the default list').setDefaultMemberPermissions(ADMIN).addStringOption(o => o.setName('emoji').setDescription('Emoji to add').setRequired(true)),
-  new SlashCommandBuilder().setName('removedefault').setDescription('Remove one emoji from the default list').setDefaultMemberPermissions(ADMIN).addStringOption(o => o.setName('emoji').setDescription('Emoji to remove').setRequired(true)),
-  new SlashCommandBuilder().setName('listdefault').setDescription('Show the default reaction emoji list').setDefaultMemberPermissions(ADMIN),
-  new SlashCommandBuilder().setName('cleardefault').setDescription('Clear all default reaction emojis').setDefaultMemberPermissions(ADMIN),
+  // ── Reaction toggles ──────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('on').setDescription('Turn auto-reactions ON').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('off').setDescription('Turn auto-reactions OFF').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('random').setDescription('Toggle random mode — reacts with ONE random emoji instead of all').setDefaultMemberPermissions(A),
 
-  // Per-user reactions
-  new SlashCommandBuilder().setName('setuseremojis').setDescription('Set custom emojis for when a specific user is pinged').setDefaultMemberPermissions(ADMIN)
-    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+  // ── Default emojis ────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('set').setDescription('Set all default reaction emojis at once').setDefaultMemberPermissions(A)
     .addStringOption(o => o.setName('emojis').setDescription('Paste emojis separated by spaces').setRequired(true)),
-  new SlashCommandBuilder().setName('adduseremoji').setDescription('Add one emoji for a specific user').setDefaultMemberPermissions(ADMIN)
-    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+  new SlashCommandBuilder().setName('add').setDescription('Add one emoji to the default list').setDefaultMemberPermissions(A)
     .addStringOption(o => o.setName('emoji').setDescription('Emoji to add').setRequired(true)),
-  new SlashCommandBuilder().setName('removeuseremoji').setDescription('Remove one emoji from a specific user').setDefaultMemberPermissions(ADMIN)
-    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+  new SlashCommandBuilder().setName('del').setDescription('Remove one emoji from the default list').setDefaultMemberPermissions(A)
     .addStringOption(o => o.setName('emoji').setDescription('Emoji to remove').setRequired(true)),
-  new SlashCommandBuilder().setName('clearuseremojis').setDescription('Clear custom emojis for a user — reverts to defaults').setDefaultMemberPermissions(ADMIN)
-    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
-  new SlashCommandBuilder().setName('listuseremojis').setDescription('Show all per-user emoji configurations').setDefaultMemberPermissions(ADMIN),
+  new SlashCommandBuilder().setName('emojis').setDescription('Show the default emoji list').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('clearemojis').setDescription('Clear all default emojis').setDefaultMemberPermissions(A),
 
-  // Mood
-  new SlashCommandBuilder().setName('togglemood').setDescription('Mood mode — react based on keywords in the message when someone is pinged').setDefaultMemberPermissions(ADMIN),
-  new SlashCommandBuilder().setName('toggleautomood').setDescription('Auto mood — react to ANY message with mood keywords (no ping required)').setDefaultMemberPermissions(ADMIN),
-  new SlashCommandBuilder().setName('listmoods').setDescription('Show all mood rules with their keywords and emojis'),
-  new SlashCommandBuilder().setName('addmood').setDescription('Add a custom mood rule — set what emojis react to a keyword').setDefaultMemberPermissions(ADMIN)
-    .addStringOption(o => o.setName('keyword').setDescription('Word or phrase that triggers this mood (e.g. "nice one")').setRequired(true))
-    .addStringOption(o => o.setName('emojis').setDescription('Emojis to react with when keyword appears').setRequired(true)),
-  new SlashCommandBuilder().setName('editmood').setDescription('Change the emojis for an existing mood rule').setDefaultMemberPermissions(ADMIN)
-    .addStringOption(o => o.setName('keyword').setDescription('The keyword of the rule to edit').setRequired(true))
-    .addStringOption(o => o.setName('emojis').setDescription('New emojis').setRequired(true)),
-  new SlashCommandBuilder().setName('removemood').setDescription('Remove a mood rule by keyword').setDefaultMemberPermissions(ADMIN)
-    .addStringOption(o => o.setName('keyword').setDescription('Keyword of the rule to remove').setRequired(true)),
-  new SlashCommandBuilder().setName('resetmoods').setDescription('Reset all mood rules back to the built-in defaults').setDefaultMemberPermissions(ADMIN),
-
-  // Reaction roles
-  new SlashCommandBuilder().setName('addreactionrole').setDescription('Give a role when someone reacts to a message with an emoji').setDefaultMemberPermissions(ADMIN)
-    .addStringOption(o => o.setName('message_id').setDescription('Message ID').setRequired(true))
-    .addStringOption(o => o.setName('emoji').setDescription('Emoji to react with').setRequired(true))
-    .addRoleOption(o => o.setName('role').setDescription('Role to give').setRequired(true))
-    .addChannelOption(o => o.setName('channel').setDescription('Channel the message is in (defaults to current)')),
-  new SlashCommandBuilder().setName('listreactionroles').setDescription('List all reaction role setups').setDefaultMemberPermissions(ADMIN),
-  new SlashCommandBuilder().setName('removereactionrole').setDescription('Remove a reaction role by its number').setDefaultMemberPermissions(ADMIN)
-    .addIntegerOption(o => o.setName('number').setDescription('Number from /listreactionroles').setRequired(true).setMinValue(1)),
-
-  // Ghost ping
-  new SlashCommandBuilder().setName('toggleghostping').setDescription('Detect deleted or edited messages that contained pings').setDefaultMemberPermissions(ADMIN),
-  new SlashCommandBuilder().setName('setghostchannel').setDescription('Set channel where ghost ping alerts are sent').setDefaultMemberPermissions(ADMIN)
-    .addChannelOption(o => o.setName('channel').setDescription('Alert channel').setRequired(true)),
-
-  // Ping leaderboard
-  new SlashCommandBuilder().setName('pingled').setDescription('Show the ping leaderboard for this server'),
-  new SlashCommandBuilder().setName('pingcount').setDescription('See how many times a user has been pinged')
-    .addUserOption(o => o.setName('user').setDescription('User (defaults to you)')),
-  new SlashCommandBuilder().setName('setmilestonechannel').setDescription('Set channel for ping milestone announcements').setDefaultMemberPermissions(ADMIN)
-    .addChannelOption(o => o.setName('channel').setDescription('Milestone channel').setRequired(true)),
-  new SlashCommandBuilder().setName('resetpingcount').setDescription('Reset ping count for a user').setDefaultMemberPermissions(ADMIN)
-    .addUserOption(o => o.setName('user').setDescription('User to reset').setRequired(true)),
-
-  // Cooldowns
-  new SlashCommandBuilder().setName('setcooldown').setDescription('Set a reaction cooldown for a user in seconds').setDefaultMemberPermissions(ADMIN)
+  // ── Per-user emojis ───────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('setuser').setDescription('Set custom emojis for when a specific user is pinged').setDefaultMemberPermissions(A)
     .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
-    .addIntegerOption(o => o.setName('seconds').setDescription('Cooldown in seconds').setRequired(true).setMinValue(5)),
-  new SlashCommandBuilder().setName('removecooldown').setDescription('Remove cooldown for a user').setDefaultMemberPermissions(ADMIN)
+    .addStringOption(o => o.setName('emojis').setDescription('Emojis').setRequired(true)),
+  new SlashCommandBuilder().setName('adduser').setDescription('Add one emoji for a specific user').setDefaultMemberPermissions(A)
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('emoji').setDescription('Emoji').setRequired(true)),
+  new SlashCommandBuilder().setName('deluser').setDescription('Remove one emoji from a specific user').setDefaultMemberPermissions(A)
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('emoji').setDescription('Emoji').setRequired(true)),
+  new SlashCommandBuilder().setName('clearuser').setDescription('Clear custom emojis for a user').setDefaultMemberPermissions(A)
     .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
-  new SlashCommandBuilder().setName('listcooldowns').setDescription('Show all active ping cooldowns').setDefaultMemberPermissions(ADMIN),
+  new SlashCommandBuilder().setName('users').setDescription('Show all per-user emoji configs').setDefaultMemberPermissions(A),
 
-  // Shield
-  new SlashCommandBuilder().setName('shield').setDescription('Protect a user — bot warns anyone who pings them').setDefaultMemberPermissions(ADMIN)
-    .addUserOption(o => o.setName('user').setDescription('User to protect').setRequired(true)),
-  new SlashCommandBuilder().setName('unshield').setDescription('Remove shield from a user').setDefaultMemberPermissions(ADMIN)
-    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
-  new SlashCommandBuilder().setName('listshields').setDescription('Show all shielded users').setDefaultMemberPermissions(ADMIN),
-  new SlashCommandBuilder().setName('setshieldchannel').setDescription('Set channel for shield violation alerts').setDefaultMemberPermissions(ADMIN)
+  // ── Role emojis (NEW) ─────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('setrole').setDescription('Set custom emojis when any member of a role is pinged').setDefaultMemberPermissions(A)
+    .addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true))
+    .addStringOption(o => o.setName('emojis').setDescription('Emojis').setRequired(true)),
+  new SlashCommandBuilder().setName('delrole').setDescription('Remove custom emojis for a role').setDefaultMemberPermissions(A)
+    .addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)),
+  new SlashCommandBuilder().setName('roles').setDescription('Show all role emoji configs').setDefaultMemberPermissions(A),
+
+  // ── Mood ──────────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('mood').setDescription('Toggle mood reactions on ping (reacts based on message keywords)').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('automood').setDescription('Toggle auto mood — reacts to any message with mood keywords (no ping needed)').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('moods').setDescription('Show all mood rules'),
+  new SlashCommandBuilder().setName('moodadd').setDescription('Add a custom mood rule').setDefaultMemberPermissions(A)
+    .addStringOption(o => o.setName('keyword').setDescription('Word or phrase that triggers this mood').setRequired(true))
+    .addStringOption(o => o.setName('emojis').setDescription('Emojis to react with').setRequired(true)),
+  new SlashCommandBuilder().setName('moodedit').setDescription('Edit emojis for an existing mood rule').setDefaultMemberPermissions(A)
+    .addStringOption(o => o.setName('keyword').setDescription('Keyword of the rule to edit').setRequired(true))
+    .addStringOption(o => o.setName('emojis').setDescription('New emojis').setRequired(true)),
+  new SlashCommandBuilder().setName('mooddel').setDescription('Remove a mood rule').setDefaultMemberPermissions(A)
+    .addStringOption(o => o.setName('keyword').setDescription('Keyword to remove').setRequired(true)),
+  new SlashCommandBuilder().setName('moodreset').setDescription('Reset mood rules to built-in defaults').setDefaultMemberPermissions(A),
+
+  // ── Reaction roles ────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('rradd').setDescription('Add a reaction role to a message').setDefaultMemberPermissions(A)
+    .addStringOption(o => o.setName('message_id').setDescription('Message ID').setRequired(true))
+    .addStringOption(o => o.setName('emoji').setDescription('Emoji').setRequired(true))
+    .addRoleOption(o => o.setName('role').setDescription('Role to give').setRequired(true))
+    .addChannelOption(o => o.setName('channel').setDescription('Channel (defaults to current)')),
+  new SlashCommandBuilder().setName('rrlist').setDescription('List all reaction roles').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('rrdel').setDescription('Remove a reaction role by number').setDefaultMemberPermissions(A)
+    .addIntegerOption(o => o.setName('number').setDescription('Number from /rrlist').setRequired(true).setMinValue(1)),
+
+  // ── Ghost ping ────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('ghost').setDescription('Toggle ghost ping detector').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('ghostlog').setDescription('Set channel for ghost ping alerts').setDefaultMemberPermissions(A)
     .addChannelOption(o => o.setName('channel').setDescription('Alert channel').setRequired(true)),
+
+  // ── Leaderboard ───────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('top').setDescription('Show the ping leaderboard'),
+  new SlashCommandBuilder().setName('count').setDescription('See how many times a user has been pinged')
+    .addUserOption(o => o.setName('user').setDescription('User (defaults to you)')),
+  new SlashCommandBuilder().setName('milestone').setDescription('Set channel for ping milestone announcements').setDefaultMemberPermissions(A)
+    .addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true)),
+  new SlashCommandBuilder().setName('resetcount').setDescription('Reset ping count for a user').setDefaultMemberPermissions(A)
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+
+  // ── Cooldown ──────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('cooldown').setDescription('Set a reaction cooldown for a user in seconds').setDefaultMemberPermissions(A)
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addIntegerOption(o => o.setName('seconds').setDescription('Cooldown seconds').setRequired(true).setMinValue(5)),
+  new SlashCommandBuilder().setName('nocooldown').setDescription('Remove cooldown for a user').setDefaultMemberPermissions(A)
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+  new SlashCommandBuilder().setName('cooldowns').setDescription('List all active cooldowns').setDefaultMemberPermissions(A),
+
+  // ── Shield ────────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('shield').setDescription('Protect a user — warns anyone who pings them').setDefaultMemberPermissions(A)
+    .addUserOption(o => o.setName('user').setDescription('User to protect').setRequired(true)),
+  new SlashCommandBuilder().setName('unshield').setDescription('Remove shield from a user').setDefaultMemberPermissions(A)
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+  new SlashCommandBuilder().setName('shields').setDescription('List all shielded users').setDefaultMemberPermissions(A),
+  new SlashCommandBuilder().setName('shieldlog').setDescription('Set channel for shield alerts').setDefaultMemberPermissions(A)
+    .addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true)),
+
+  // ── Block (NEW) ───────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('block').setDescription('Block a user — bot ignores pings sent by them').setDefaultMemberPermissions(A)
+    .addUserOption(o => o.setName('user').setDescription('User to block').setRequired(true)),
+  new SlashCommandBuilder().setName('unblock').setDescription('Unblock a user').setDefaultMemberPermissions(A)
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)),
+  new SlashCommandBuilder().setName('blocked').setDescription('List all blocked users').setDefaultMemberPermissions(A),
+
+  // ── Hours (NEW) ───────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('hours').setDescription('Only auto-react during certain hours (UTC)').setDefaultMemberPermissions(A)
+    .addIntegerOption(o => o.setName('start').setDescription('Start hour in UTC (0-23)').setRequired(true).setMinValue(0).setMaxValue(23))
+    .addIntegerOption(o => o.setName('end').setDescription('End hour in UTC (0-23)').setRequired(true).setMinValue(0).setMaxValue(23)),
+  new SlashCommandBuilder().setName('nohours').setDescription('Remove time restriction — react 24/7').setDefaultMemberPermissions(A),
+
+  // ── Rain (NEW) ────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder().setName('rain').setDescription('React to the last N messages with an emoji').setDefaultMemberPermissions(A)
+    .addStringOption(o => o.setName('emoji').setDescription('Emoji to react with').setRequired(true))
+    .addIntegerOption(o => o.setName('count').setDescription('Number of messages (1-20)').setRequired(true).setMinValue(1).setMaxValue(20)),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   try {
     await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
-    console.log('Slash commands registered');
-  } catch (err) {
-    console.error('Failed to register commands:', err.message);
-  }
+    console.log('Commands registered');
+  } catch (e) { console.error('Register failed:', e.message); }
 }
 
 client.once('ready', async () => {
@@ -269,489 +316,436 @@ client.once('ready', async () => {
   await registerCommands();
 });
 
-// ── Panel sections helper ─────────────────────────────────────────────────────
-function buildPanelEmbed(cfg) {
-  const statusLine = (on) => on ? '`ON`' : '`OFF`';
-  return new EmbedBuilder()
-    .setColor(0x5865F2)
-    .setTitle('⚙️ CEAS REACTION — Control Panel')
-    .setDescription('All settings for this server. Only admins can use config commands.')
+// ── Panel ─────────────────────────────────────────────────────────────────────
+function panelEmbed(cfg) {
+  const s = (v) => v ? '`ON`' : '`OFF`';
+  const hoursStr = cfg.hoursStart !== null ? `${cfg.hoursStart}:00–${cfg.hoursEnd}:00 UTC` : 'Always (24/7)';
+  return new EmbedBuilder().setColor(0x5865F2).setTitle('⚙️ CEAS REACTION — Control Panel')
     .addFields(
-      {
-        name: '─── 🔔 Ping Reactions ───',
-        value: [
-          `Auto-react: ${statusLine(cfg.reactionsEnabled)} | Random mode: ${statusLine(cfg.randomMode)}`,
-          `Default emojis: ${cfg.defaultReactions.length ? cfg.defaultReactions.map(emojiDisplay).join(' ') : '*(none set)*'}`,
-          `Per-user configs: **${Object.keys(cfg.userReactions).length}** users`,
-          '`/setdefault` `/adddefault` `/removedefault` `/listdefault` `/cleardefault`',
-          '`/setuseremojis` `/adduseremoji` `/removeuseremoji` `/clearuseremojis` `/listuseremojis`',
-          '`/togglereactions` `/togglerandom`',
-        ].join('\n'),
-        inline: false,
-      },
-      {
-        name: '─── 🎭 Mood Reactions ───',
-        value: [
-          `Mood on ping: ${statusLine(cfg.moodReactionsEnabled)} | Auto mood (any msg): ${statusLine(cfg.autoMoodEnabled)}`,
-          `Mood rules: **${cfg.moodRules.length}** rules`,
-          '`/togglemood` `/toggleautomood` `/listmoods`',
-          '`/addmood` `/editmood` `/removemood` `/resetmoods`',
-        ].join('\n'),
-        inline: false,
-      },
-      {
-        name: '─── 🎯 Reaction Roles ───',
-        value: [
-          `Active setups: **${cfg.reactionRoles.length}**`,
-          '`/addreactionrole` `/listreactionroles` `/removereactionrole`',
-        ].join('\n'),
-        inline: false,
-      },
-      {
-        name: '─── 👻 Ghost Ping Detector ───',
-        value: [
-          `Status: ${statusLine(cfg.ghostPingEnabled)} | Alert channel: ${cfg.ghostPingChannelId ? `<#${cfg.ghostPingChannelId}>` : '*(same channel)*'}`,
-          '`/toggleghostping` `/setghostchannel`',
-        ].join('\n'),
-        inline: false,
-      },
-      {
-        name: '─── 📊 Ping Leaderboard ───',
-        value: [
-          `Milestone channel: ${cfg.pingMilestoneChannelId ? `<#${cfg.pingMilestoneChannelId}>` : '*(not set)*'}`,
-          `Milestones fire at: ${MILESTONES.join(', ')} pings`,
-          '`/pingled` `/pingcount` `/resetpingcount` `/setmilestonechannel`',
-        ].join('\n'),
-        inline: false,
-      },
-      {
-        name: '─── ⏱️ Cooldowns ───',
-        value: [
-          `Active cooldowns: **${Object.keys(cfg.pingCooldownSeconds).length}** users`,
-          '`/setcooldown` `/removecooldown` `/listcooldowns`',
-        ].join('\n'),
-        inline: false,
-      },
-      {
-        name: '─── 🛡️ Anti-Ping Shield ───',
-        value: [
-          `Shielded users: **${cfg.shieldedUsers.length}** | Alert channel: ${cfg.shieldAlertChannelId ? `<#${cfg.shieldAlertChannelId}>` : '*(same channel)*'}`,
-          '`/shield` `/unshield` `/listshields` `/setshieldchannel`',
-        ].join('\n'),
-        inline: false,
-      },
+      { name: '─── 🔔 Reactions', value: `Auto-react: ${s(cfg.on)} | Random: ${s(cfg.random)} | Hours: ${hoursStr}\nDefault emojis: ${cfg.defaultEmojis.length ? cfg.defaultEmojis.map(disp).join(' ') : '*(none)*'}\nPer-user: **${Object.keys(cfg.userEmojis).length}** | Per-role: **${Object.keys(cfg.roleEmojis).length}**\n\`/on\` \`/off\` \`/random\` \`/set\` \`/add\` \`/del\` \`/emojis\` \`/clearemojis\`\n\`/setuser\` \`/adduser\` \`/deluser\` \`/clearuser\` \`/users\`\n\`/setrole\` \`/delrole\` \`/roles\`\n\`/hours\` \`/nohours\``, inline: false },
+      { name: '─── 🎭 Mood', value: `Mood on ping: ${s(cfg.mood)} | Auto mood: ${s(cfg.automood)} | Rules: **${cfg.moods.length}**\n\`/mood\` \`/automood\` \`/moods\` \`/moodadd\` \`/moodedit\` \`/mooddel\` \`/moodreset\``, inline: false },
+      { name: '─── 🎯 Reaction Roles', value: `Active: **${cfg.reactionRoles.length}**\n\`/rradd\` \`/rrlist\` \`/rrdel\``, inline: false },
+      { name: '─── 👻 Ghost Ping', value: `Status: ${s(cfg.ghost)} | Log: ${cfg.ghostLog ? `<#${cfg.ghostLog}>` : '*(same channel)*'}\n\`/ghost\` \`/ghostlog\``, inline: false },
+      { name: '─── 📊 Leaderboard', value: `Milestone log: ${cfg.milestoneLog ? `<#${cfg.milestoneLog}>` : '*(not set)*'}\n\`/top\` \`/count\` \`/resetcount\` \`/milestone\``, inline: false },
+      { name: '─── ⏱️ Cooldown', value: `Active: **${Object.keys(cfg.cooldowns).length}** users\n\`/cooldown\` \`/nocooldown\` \`/cooldowns\``, inline: false },
+      { name: '─── 🛡️ Shield & Block', value: `Shielded: **${cfg.shields.length}** | Blocked: **${cfg.blocked.length}** | Shield log: ${cfg.shieldLog ? `<#${cfg.shieldLog}>` : '*(same channel)*'}\n\`/shield\` \`/unshield\` \`/shields\` \`/shieldlog\`\n\`/block\` \`/unblock\` \`/blocked\``, inline: false },
+      { name: '─── 🌧️ Rain', value: 'React to the last N messages with any emoji\n`/rain`', inline: false },
     )
-    .setFooter({ text: 'Use /help <category> for detailed info on any section.' })
-    .setTimestamp();
+    .setFooter({ text: 'Use /help <category> for detailed command info.' }).setTimestamp();
 }
 
-// ── Help embeds by category ───────────────────────────────────────────────────
-function buildHelpEmbed(category) {
-  const base = new EmbedBuilder().setColor(0x5865F2).setTimestamp();
-
-  if (!category || category === 'all') {
-    return base.setTitle('📖 CEAS REACTION — Command Categories')
-      .setDescription('Use `/help <category>` to see detailed commands for each section.')
-      .addFields(
-        { name: '🔔 Reactions', value: 'Set emojis, per-user emojis, random mode\n`/help reactions`', inline: true },
-        { name: '🎭 Mood', value: 'Mood & auto mood reactions, custom rules\n`/help mood`', inline: true },
-        { name: '🎯 Reaction Roles', value: 'Assign roles via emoji reactions\n`/help roles`', inline: true },
-        { name: '👻 Ghost Ping', value: 'Detect deleted/edited pings\n`/help ghost`', inline: true },
-        { name: '📊 Leaderboard', value: 'Ping counts, milestones, stats\n`/help leaderboard`', inline: true },
-        { name: '🛡️ Shield', value: 'Protect users from being pinged\n`/help shield`', inline: true },
-        { name: '⚙️ Settings', value: 'Cooldowns, toggles, panel\n`/help settings`', inline: true },
-      );
-  }
-
-  if (category === 'reactions') {
-    return base.setTitle('🔔 Ping Reactions — Commands')
-      .addFields(
-        { name: '`/togglereactions`', value: 'Turn all auto-reactions on or off.', inline: false },
-        { name: '`/togglerandom`', value: 'When ON, picks **one random emoji** from your list each ping instead of all of them.', inline: false },
-        { name: '`/setdefault <emojis>`', value: 'Replace the entire default emoji list. Paste emojis separated by spaces.\nWorks with standard, custom `<:name:ID>`, and Nitro `<a:name:ID>` emojis.', inline: false },
-        { name: '`/adddefault <emoji>`', value: 'Add a single emoji to the default list.', inline: false },
-        { name: '`/removedefault <emoji>`', value: 'Remove a single emoji from the default list.', inline: false },
-        { name: '`/listdefault`', value: 'Show the current default emoji list.', inline: false },
-        { name: '`/cleardefault`', value: 'Remove all default emojis.', inline: false },
-        { name: '`/setuseremojis @user <emojis>`', value: 'Set unique emojis for when a **specific user** is pinged. Overrides defaults for that user.', inline: false },
-        { name: '`/adduseremoji @user <emoji>`', value: 'Add one emoji for a specific user.', inline: false },
-        { name: '`/removeuseremoji @user <emoji>`', value: 'Remove one emoji from a specific user.', inline: false },
-        { name: '`/clearuseremojis @user`', value: 'Remove all custom emojis for a user — they fall back to the default list.', inline: false },
-        { name: '`/listuseremojis`', value: 'See every user with custom emoji configs.', inline: false },
-      );
-  }
-
-  if (category === 'mood') {
-    return base.setTitle('🎭 Mood Reactions — Commands')
-      .setDescription('Mood reactions detect keywords in messages and react with themed emojis.')
-      .addFields(
-        { name: '`/togglemood`', value: '**Ping mood** — When a user is pinged AND the message contains a mood keyword, the bot uses mood emojis instead of the normal ones.', inline: false },
-        { name: '`/toggleautomood`', value: '**Auto mood** — Bot reacts to ANY message that contains a mood keyword, even if nobody is pinged. Great for active servers.', inline: false },
-        { name: '`/listmoods`', value: 'Show all mood rules: keyword → emojis. Includes built-in rules and any you have added.', inline: false },
-        { name: '`/addmood <keyword> <emojis>`', value: 'Add a new mood rule.\nExample: `/addmood keyword:nice one emojis:😍🔥`', inline: false },
-        { name: '`/editmood <keyword> <emojis>`', value: 'Change the emojis for an existing mood rule.\nExample: `/editmood keyword:gg emojis:🥇👑`', inline: false },
-        { name: '`/removemood <keyword>`', value: 'Delete a mood rule by its keyword.', inline: false },
-        { name: '`/resetmoods`', value: 'Wipe all custom rules and restore the built-in defaults.', inline: false },
-        { name: 'Built-in keywords', value: 'happy birthday, hbd, gg, well played, rip, welcome, congrats, good morning, gm, good night, gn, love you, ily, bruh, lets go, skill issue, ban, good luck, gl, sus, pog, based, cringe, w, l', inline: false },
-      );
-  }
-
-  if (category === 'roles') {
-    return base.setTitle('🎯 Reaction Roles — Commands')
-      .setDescription('Give roles to users automatically when they react to a message.')
-      .addFields(
-        { name: '`/addreactionrole`', value: 'Set up a reaction role.\n**message_id** — Right-click a message → Copy Message ID\n**emoji** — The emoji users react with\n**role** — The role they receive\n**channel** — Where the message is (optional, defaults to current channel)', inline: false },
-        { name: '`/listreactionroles`', value: 'Show all active reaction role setups with links.', inline: false },
-        { name: '`/removereactionrole <number>`', value: 'Remove a reaction role by its number from `/listreactionroles`.', inline: false },
-        { name: 'How to get a Message ID', value: '1. Enable Developer Mode in Discord settings\n2. Right-click any message\n3. Click "Copy Message ID"', inline: false },
-      );
-  }
-
-  if (category === 'ghost') {
-    return base.setTitle('👻 Ghost Ping Detector — Commands')
-      .setDescription('Catches users who ping someone then delete or edit the message to hide it.')
-      .addFields(
-        { name: '`/toggleghostping`', value: 'Turn ghost ping detection on or off.', inline: false },
-        { name: '`/setghostchannel <channel>`', value: 'Choose a channel for ghost ping alerts. If not set, the alert goes to the same channel as the deleted message.', inline: false },
-        { name: 'What it detects', value: '**Deleted pings** — Someone pinged a user then deleted the message.\n**Edited pings** — Someone pinged a user then edited the message to remove the ping.', inline: false },
-        { name: 'Alert includes', value: 'Who sent it, who was pinged, and the original message content.', inline: false },
-      );
-  }
-
-  if (category === 'leaderboard') {
-    return base.setTitle('📊 Ping Leaderboard — Commands')
-      .setDescription('Tracks how many times each user has been pinged in the server.')
-      .addFields(
-        { name: '`/pingled`', value: 'Show the top 10 most-pinged users in the server.', inline: false },
-        { name: '`/pingcount [@user]`', value: 'See how many times a user has been pinged. Defaults to yourself.', inline: false },
-        { name: '`/setmilestonechannel <channel>`', value: `Set a channel for milestone announcements. Bot posts when a user hits ${MILESTONES.join(', ')} pings.`, inline: false },
-        { name: '`/resetpingcount @user`', value: 'Reset the ping counter for a specific user to 0.', inline: false },
-      );
-  }
-
-  if (category === 'shield') {
-    return base.setTitle('🛡️ Anti-Ping Shield — Commands')
-      .setDescription('Protect specific users. Anyone who pings a shielded user receives a warning.')
-      .addFields(
-        { name: '`/shield @user`', value: 'Add a user to the shield list. Bot will warn anyone who pings them.', inline: false },
-        { name: '`/unshield @user`', value: 'Remove a user from the shield list.', inline: false },
-        { name: '`/listshields`', value: 'Show all currently shielded users.', inline: false },
-        { name: '`/setshieldchannel <channel>`', value: 'Choose a channel for shield alerts. If not set, the alert is sent in the same channel as the ping.', inline: false },
-      );
-  }
-
-  if (category === 'settings') {
-    return base.setTitle('⚙️ Settings & Cooldowns — Commands')
-      .addFields(
-        { name: '`/panel`', value: 'Full control panel showing all settings and their current status at a glance.', inline: false },
-        { name: '`/settings`', value: 'Compact view of all current settings.', inline: false },
-        { name: '`/ping`', value: 'Check the bot\'s latency.', inline: false },
-        { name: '`/setcooldown @user <seconds>`', value: 'Set a cooldown for a user. Bot will only react to their pings once per cooldown period.\nExample: `/setcooldown @user seconds:60` = react at most once per minute.', inline: false },
-        { name: '`/removecooldown @user`', value: 'Remove the cooldown for a user.', inline: false },
-        { name: '`/listcooldowns`', value: 'Show all users who have a cooldown set.', inline: false },
-      );
-  }
-
-  return base.setTitle('Help').setDescription('Unknown category. Use `/help` to see all categories.');
+// ── Help ──────────────────────────────────────────────────────────────────────
+function helpEmbed(cat) {
+  const e = new EmbedBuilder().setColor(0x5865F2).setTimestamp();
+  if (!cat || cat === 'all') return e.setTitle('📖 CEAS REACTION — Help')
+    .setDescription('Use `/help category:<name>` for details on each section.')
+    .addFields(
+      { name: '🔔 Reactions', value: '`/help reactions`', inline: true },
+      { name: '🎭 Mood', value: '`/help mood`', inline: true },
+      { name: '🎯 Reaction Roles', value: '`/help rr`', inline: true },
+      { name: '👻 Ghost Ping', value: '`/help ghost`', inline: true },
+      { name: '📊 Leaderboard', value: '`/help lb`', inline: true },
+      { name: '🛡️ Shield & Block', value: '`/help shield`', inline: true },
+      { name: '⚙️ Other', value: '`/help other`', inline: true },
+    );
+  if (cat === 'reactions') return e.setTitle('🔔 Reactions').addFields(
+    { name: '`/on` / `/off`', value: 'Turn all auto-reactions on or off.' },
+    { name: '`/random`', value: 'Toggle random mode — picks ONE emoji per ping.' },
+    { name: '`/set <emojis>`', value: 'Replace ALL default emojis. Paste any mix of standard/custom/Nitro emojis.' },
+    { name: '`/add <emoji>`', value: 'Add one emoji to the default list.' },
+    { name: '`/del <emoji>`', value: 'Remove one emoji from the default list.' },
+    { name: '`/emojis`', value: 'Show the current default emoji list.' },
+    { name: '`/clearemojis`', value: 'Remove all default emojis.' },
+    { name: '`/setuser @user <emojis>`', value: 'Set unique emojis for a specific user when pinged. Overrides defaults.' },
+    { name: '`/adduser @user <emoji>`', value: 'Add one emoji for a user.' },
+    { name: '`/deluser @user <emoji>`', value: 'Remove one emoji from a user.' },
+    { name: '`/clearuser @user`', value: 'Clear all custom emojis for a user (falls back to defaults).' },
+    { name: '`/users`', value: 'Show all per-user emoji configs.' },
+    { name: '`/setrole @role <emojis>`', value: 'Set emojis when any member of a role is pinged.' },
+    { name: '`/delrole @role`', value: 'Remove role emoji config.' },
+    { name: '`/roles`', value: 'Show all role emoji configs.' },
+    { name: '`/hours <start> <end>`', value: 'Only auto-react between these hours (UTC). e.g. `/hours start:9 end:17` = 9am–5pm UTC.' },
+    { name: '`/nohours`', value: 'Remove the time restriction — react 24/7.' },
+    { name: '`/rain <emoji> <count>`', value: 'React to the last N messages (up to 20) with an emoji all at once.' },
+  );
+  if (cat === 'mood') return e.setTitle('🎭 Mood').addFields(
+    { name: '`/mood`', value: 'When someone is **pinged** AND the message contains a keyword → use mood emojis.' },
+    { name: '`/automood`', value: 'React to **any message** with a mood keyword — no ping needed.' },
+    { name: '`/moods`', value: 'List all mood rules.' },
+    { name: '`/moodadd <keyword> <emojis>`', value: 'Add a new mood rule. Example: `/moodadd keyword:nice one emojis:😍🔥`' },
+    { name: '`/moodedit <keyword> <emojis>`', value: 'Change the emojis for an existing rule. Works with custom/Nitro emojis.' },
+    { name: '`/mooddel <keyword>`', value: 'Delete a mood rule.' },
+    { name: '`/moodreset`', value: 'Wipe all custom rules and restore built-in defaults.' },
+  );
+  if (cat === 'rr') return e.setTitle('🎯 Reaction Roles').addFields(
+    { name: '`/rradd`', value: 'Set up a reaction role.\n**message_id** — Right-click message → Copy Message ID (needs Developer Mode)\n**emoji** — Emoji users react with\n**role** — Role they receive\n**channel** — Where the message is (optional)' },
+    { name: '`/rrlist`', value: 'Show all reaction role setups.' },
+    { name: '`/rrdel <number>`', value: 'Remove a reaction role by its number from `/rrlist`.' },
+  );
+  if (cat === 'ghost') return e.setTitle('👻 Ghost Ping').addFields(
+    { name: '`/ghost`', value: 'Toggle ghost ping detection on/off.' },
+    { name: '`/ghostlog <channel>`', value: 'Set which channel receives ghost ping alerts.' },
+    { name: 'What it catches', value: '**Deleted** — Someone pinged then deleted the message.\n**Edited** — Someone pinged then edited out the ping.' },
+  );
+  if (cat === 'lb') return e.setTitle('📊 Leaderboard').addFields(
+    { name: '`/top`', value: 'Top 10 most-pinged users in the server.' },
+    { name: '`/count [@user]`', value: 'See how many times a user has been pinged.' },
+    { name: '`/milestone <channel>`', value: `Announce when users hit ping milestones: ${MILESTONES.join(', ')}.` },
+    { name: '`/resetcount @user`', value: 'Reset ping count for a user.' },
+  );
+  if (cat === 'shield') return e.setTitle('🛡️ Shield & Block').addFields(
+    { name: '`/shield @user`', value: 'Protect a user — bot warns anyone who pings them.' },
+    { name: '`/unshield @user`', value: 'Remove shield.' },
+    { name: '`/shields`', value: 'List all shielded users.' },
+    { name: '`/shieldlog <channel>`', value: 'Set channel for shield alerts.' },
+    { name: '`/block @user`', value: 'Block a user — bot will NOT react to ANY ping sent by them.' },
+    { name: '`/unblock @user`', value: 'Unblock a user.' },
+    { name: '`/blocked`', value: 'List all blocked users.' },
+  );
+  if (cat === 'other') return e.setTitle('⚙️ Other').addFields(
+    { name: '`/cooldown @user <seconds>`', value: 'React to their pings at most once every N seconds.' },
+    { name: '`/nocooldown @user`', value: 'Remove cooldown.' },
+    { name: '`/cooldowns`', value: 'List all cooldowns.' },
+    { name: '`/panel`', value: 'Full control panel with all settings.' },
+    { name: '`/settings`', value: 'Quick settings overview.' },
+    { name: '`/ping`', value: 'Bot latency.' },
+  );
+  return e.setDescription('Unknown category. Use `/help` for the list.');
 }
 
-// ── Slash command handler ─────────────────────────────────────────────────────
+// ── Command handler ───────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  const { commandName, guild } = interaction;
+  const { commandName: cmd, guild } = interaction;
   const cfg = guild ? getGuild(guild.id) : {};
 
-  if (commandName === 'panel') {
-    return interaction.reply({ embeds: [buildPanelEmbed(cfg)], ephemeral: true });
+  if (cmd === 'panel') return interaction.reply({ embeds: [panelEmbed(cfg)], ephemeral: true });
+  if (cmd === 'help') return interaction.reply({ embeds: [helpEmbed(interaction.options.getString('category'))], ephemeral: true });
+  if (cmd === 'ping') {
+    const s = await interaction.reply({ content: 'Pinging...', fetchReply: true });
+    return interaction.editReply(`Pong! **${s.createdTimestamp - interaction.createdTimestamp}ms** | API: **${Math.round(client.ws.ping)}ms**`);
   }
-
-  if (commandName === 'help') {
-    const category = interaction.options.getString('category') || 'all';
-    return interaction.reply({ embeds: [buildHelpEmbed(category)], ephemeral: true });
-  }
-
-  if (commandName === 'settings') {
+  if (cmd === 'settings') {
     const g = cfg;
-    const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('Current Settings')
-      .addFields(
-        { name: 'Auto-reactions', value: g.reactionsEnabled ? 'ON' : 'OFF', inline: true },
-        { name: 'Random Mode', value: g.randomMode ? 'ON' : 'OFF', inline: true },
-        { name: 'Mood on Ping', value: g.moodReactionsEnabled ? 'ON' : 'OFF', inline: true },
-        { name: 'Auto Mood', value: g.autoMoodEnabled ? 'ON' : 'OFF', inline: true },
-        { name: 'Ghost Ping', value: g.ghostPingEnabled ? 'ON' : 'OFF', inline: true },
-        { name: 'Default Emojis', value: g.defaultReactions.length ? g.defaultReactions.map(emojiDisplay).join(' ') : '*(none)*', inline: false },
-        { name: 'Per-user configs', value: `${Object.keys(g.userReactions).length} users`, inline: true },
-        { name: 'Mood Rules', value: `${g.moodRules.length} rules`, inline: true },
-        { name: 'Reaction Roles', value: `${g.reactionRoles.length}`, inline: true },
-        { name: 'Shielded Users', value: `${g.shieldedUsers.length}`, inline: true },
-        { name: 'Cooldowns', value: `${Object.keys(g.pingCooldownSeconds).length} users`, inline: true },
-      ).setFooter({ text: 'Use /panel for the full overview with commands.' }).setTimestamp();
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    const e = new EmbedBuilder().setColor(0x5865F2).setTitle('Settings').addFields(
+      { name: 'Auto-react', value: g.on ? 'ON' : 'OFF', inline: true },
+      { name: 'Random', value: g.random ? 'ON' : 'OFF', inline: true },
+      { name: 'Mood on ping', value: g.mood ? 'ON' : 'OFF', inline: true },
+      { name: 'Auto Mood', value: g.automood ? 'ON' : 'OFF', inline: true },
+      { name: 'Ghost Ping', value: g.ghost ? 'ON' : 'OFF', inline: true },
+      { name: 'Hours (UTC)', value: g.hoursStart !== null ? `${g.hoursStart}:00–${g.hoursEnd}:00` : '24/7', inline: true },
+      { name: 'Default Emojis', value: g.defaultEmojis.length ? g.defaultEmojis.map(disp).join(' ') : '*(none)*', inline: false },
+      { name: 'Per-user', value: `${Object.keys(g.userEmojis).length}`, inline: true },
+      { name: 'Per-role', value: `${Object.keys(g.roleEmojis).length}`, inline: true },
+      { name: 'Mood Rules', value: `${g.moods.length}`, inline: true },
+      { name: 'Reaction Roles', value: `${g.reactionRoles.length}`, inline: true },
+      { name: 'Shielded', value: `${g.shields.length}`, inline: true },
+      { name: 'Blocked', value: `${g.blocked.length}`, inline: true },
+    ).setFooter({ text: 'Use /panel for the full overview.' }).setTimestamp();
+    return interaction.reply({ embeds: [e], ephemeral: true });
   }
 
-  if (commandName === 'ping') {
-    const sent = await interaction.reply({ content: 'Pinging...', fetchReply: true });
-    return interaction.editReply(`Pong! Latency: **${sent.createdTimestamp - interaction.createdTimestamp}ms** | API: **${Math.round(client.ws.ping)}ms**`);
+  // ── Toggles ──
+  if (cmd === 'on') { setGuild(guild.id, { on: true }); return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription('✅ Auto-reactions are now **ON**.')], ephemeral: true }); }
+  if (cmd === 'off') { setGuild(guild.id, { on: false }); return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription('❌ Auto-reactions are now **OFF**.')], ephemeral: true }); }
+  if (cmd === 'random') {
+    const u = setGuild(guild.id, { random: !cfg.random });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(u.random ? 0x57F287 : 0xFEE75C).setDescription(u.random ? '🎲 Random mode **ON** — picks ONE emoji per ping.' : '🎲 Random mode **OFF** — uses all emojis.')], ephemeral: true });
   }
 
-  if (commandName === 'togglereactions') {
-    const updated = setGuild(guild.id, { reactionsEnabled: !cfg.reactionsEnabled });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(updated.reactionsEnabled ? 0x57F287 : 0xED4245).setDescription(`Auto-reactions are now **${updated.reactionsEnabled ? 'ON' : 'OFF'}**.`)], ephemeral: true });
-  }
-
-  if (commandName === 'togglerandom') {
-    const updated = setGuild(guild.id, { randomMode: !cfg.randomMode });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(updated.randomMode ? 0x57F287 : 0xFEE75C)
-      .setTitle(`Random Mode ${updated.randomMode ? 'ON' : 'OFF'}`)
-      .setDescription(updated.randomMode ? 'Bot picks ONE random emoji from your list each ping.' : 'Bot reacts with ALL emojis from your list.')], ephemeral: true });
-  }
-
-  // Default reactions
-  if (commandName === 'setdefault') {
-    const emojis = parseManyEmojis(interaction.options.getString('emojis'));
+  // ── Default emojis ──
+  if (cmd === 'set') {
+    const emojis = many(interaction.options.getString('emojis'));
     if (!emojis.length) return interaction.reply({ content: 'No valid emojis found.', ephemeral: true });
-    setGuild(guild.id, { defaultReactions: emojis });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Default reactions set to: ${emojis.map(emojiDisplay).join(' ')}`)], ephemeral: true });
+    setGuild(guild.id, { defaultEmojis: emojis });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Default emojis set: ${emojis.map(disp).join(' ')}`)], ephemeral: true });
   }
-  if (commandName === 'adddefault') {
-    const emoji = parseOneEmoji(interaction.options.getString('emoji'));
-    if (!emoji) return interaction.reply({ content: 'No valid emoji found.', ephemeral: true });
-    const list = [...new Set([...cfg.defaultReactions, emoji])];
-    setGuild(guild.id, { defaultReactions: list });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Added ${emojiDisplay(emoji)}. Current list: ${list.map(emojiDisplay).join(' ')}`)], ephemeral: true });
+  if (cmd === 'add') {
+    const emoji = one(interaction.options.getString('emoji'));
+    if (!emoji) return interaction.reply({ content: 'No valid emoji.', ephemeral: true });
+    const list = [...new Set([...cfg.defaultEmojis, emoji])];
+    setGuild(guild.id, { defaultEmojis: list });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Added ${disp(emoji)}. List: ${list.map(disp).join(' ')}`)], ephemeral: true });
   }
-  if (commandName === 'removedefault') {
-    const emoji = parseOneEmoji(interaction.options.getString('emoji'));
-    if (!emoji) return interaction.reply({ content: 'No valid emoji found.', ephemeral: true });
-    const list = cfg.defaultReactions.filter(e => e !== emoji);
-    setGuild(guild.id, { defaultReactions: list });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFEE75C).setDescription(`Removed ${emojiDisplay(emoji)}. Remaining: ${list.map(emojiDisplay).join(' ') || '*(none)*'}`)], ephemeral: true });
+  if (cmd === 'del') {
+    const emoji = one(interaction.options.getString('emoji'));
+    if (!emoji) return interaction.reply({ content: 'No valid emoji.', ephemeral: true });
+    const list = cfg.defaultEmojis.filter(e => e !== emoji);
+    setGuild(guild.id, { defaultEmojis: list });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFEE75C).setDescription(`Removed ${disp(emoji)}. Remaining: ${list.map(disp).join(' ') || '*(none)*'}`)], ephemeral: true });
   }
-  if (commandName === 'listdefault') {
-    const list = cfg.defaultReactions.length ? cfg.defaultReactions.map((e, i) => `${i + 1}. ${emojiDisplay(e)}`).join('\n') : 'No default emojis set. Use `/adddefault` to add one.';
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Default Reaction Emojis').setDescription(list)], ephemeral: true });
+  if (cmd === 'emojis') {
+    const list = cfg.defaultEmojis.length ? cfg.defaultEmojis.map((e, i) => `${i + 1}. ${disp(e)}`).join('\n') : 'No default emojis. Use `/add` to add one.';
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Default Emojis').setDescription(list)], ephemeral: true });
   }
-  if (commandName === 'cleardefault') {
-    setGuild(guild.id, { defaultReactions: [] });
+  if (cmd === 'clearemojis') {
+    setGuild(guild.id, { defaultEmojis: [] });
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription('All default emojis cleared.')], ephemeral: true });
   }
 
-  // Per-user reactions
-  if (commandName === 'setuseremojis') {
+  // ── Per-user emojis ──
+  if (cmd === 'setuser') {
     const user = interaction.options.getUser('user');
-    const emojis = parseManyEmojis(interaction.options.getString('emojis'));
-    if (!emojis.length) return interaction.reply({ content: 'No valid emojis found.', ephemeral: true });
-    setGuild(guild.id, { userReactions: { ...cfg.userReactions, [user.id]: emojis } });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`When ${user} is pinged, bot reacts with: ${emojis.map(emojiDisplay).join(' ')}`)], ephemeral: true });
+    const emojis = many(interaction.options.getString('emojis'));
+    if (!emojis.length) return interaction.reply({ content: 'No valid emojis.', ephemeral: true });
+    setGuild(guild.id, { userEmojis: { ...cfg.userEmojis, [user.id]: emojis } });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`When ${user} is pinged → ${emojis.map(disp).join(' ')}`)], ephemeral: true });
   }
-  if (commandName === 'adduseremoji') {
+  if (cmd === 'adduser') {
     const user = interaction.options.getUser('user');
-    const emoji = parseOneEmoji(interaction.options.getString('emoji'));
-    if (!emoji) return interaction.reply({ content: 'No valid emoji found.', ephemeral: true });
-    const list = [...new Set([...(cfg.userReactions[user.id] || []), emoji])];
-    setGuild(guild.id, { userReactions: { ...cfg.userReactions, [user.id]: list } });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Added ${emojiDisplay(emoji)} for ${user}. Full list: ${list.map(emojiDisplay).join(' ')}`)], ephemeral: true });
+    const emoji = one(interaction.options.getString('emoji'));
+    if (!emoji) return interaction.reply({ content: 'No valid emoji.', ephemeral: true });
+    const list = [...new Set([...(cfg.userEmojis[user.id] || []), emoji])];
+    setGuild(guild.id, { userEmojis: { ...cfg.userEmojis, [user.id]: list } });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Added ${disp(emoji)} for ${user}. All: ${list.map(disp).join(' ')}`)], ephemeral: true });
   }
-  if (commandName === 'removeuseremoji') {
+  if (cmd === 'deluser') {
     const user = interaction.options.getUser('user');
-    const emoji = parseOneEmoji(interaction.options.getString('emoji'));
-    if (!emoji) return interaction.reply({ content: 'No valid emoji found.', ephemeral: true });
-    const list = (cfg.userReactions[user.id] || []).filter(e => e !== emoji);
-    const ur = { ...cfg.userReactions };
-    if (list.length) ur[user.id] = list; else delete ur[user.id];
-    setGuild(guild.id, { userReactions: ur });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFEE75C).setDescription(list.length ? `Removed for ${user}. Remaining: ${list.map(emojiDisplay).join(' ')}` : `Removed for ${user}. They now use default emojis.`)], ephemeral: true });
+    const emoji = one(interaction.options.getString('emoji'));
+    if (!emoji) return interaction.reply({ content: 'No valid emoji.', ephemeral: true });
+    const list = (cfg.userEmojis[user.id] || []).filter(e => e !== emoji);
+    const ue = { ...cfg.userEmojis };
+    if (list.length) ue[user.id] = list; else delete ue[user.id];
+    setGuild(guild.id, { userEmojis: ue });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFEE75C).setDescription(list.length ? `Removed for ${user}. Left: ${list.map(disp).join(' ')}` : `Removed for ${user}. Now uses defaults.`)], ephemeral: true });
   }
-  if (commandName === 'clearuseremojis') {
+  if (cmd === 'clearuser') {
     const user = interaction.options.getUser('user');
-    const ur = { ...cfg.userReactions };
-    delete ur[user.id];
-    setGuild(guild.id, { userReactions: ur });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`Custom emojis cleared for ${user}. They now use defaults.`)], ephemeral: true });
+    const ue = { ...cfg.userEmojis };
+    delete ue[user.id];
+    setGuild(guild.id, { userEmojis: ue });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`Custom emojis cleared for ${user}.`)], ephemeral: true });
   }
-  if (commandName === 'listuseremojis') {
-    const entries = Object.entries(cfg.userReactions);
-    if (!entries.length) return interaction.reply({ content: 'No per-user configs. Use `/setuseremojis @user <emojis>` to add one.', ephemeral: true });
-    const lines = entries.map(([id, emojis], i) => `${i + 1}. <@${id}> → ${emojis.map(emojiDisplay).join(' ')}`).join('\n');
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Per-User Emoji Configs').setDescription(lines).setFooter({ text: 'Users not listed fall back to default emojis.' })], ephemeral: true });
+  if (cmd === 'users') {
+    const entries = Object.entries(cfg.userEmojis);
+    if (!entries.length) return interaction.reply({ content: 'No per-user configs. Use `/setuser @user <emojis>`.', ephemeral: true });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Per-User Emojis').setDescription(entries.map(([id, em], i) => `${i + 1}. <@${id}> → ${em.map(disp).join(' ')}`).join('\n')).setFooter({ text: 'Users not listed use default or role emojis.' })], ephemeral: true });
   }
 
-  // Mood
-  if (commandName === 'togglemood') {
-    const updated = setGuild(guild.id, { moodReactionsEnabled: !cfg.moodReactionsEnabled });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(updated.moodReactionsEnabled ? 0x57F287 : 0xFEE75C)
-      .setTitle(`Mood Reactions (on ping) — ${updated.moodReactionsEnabled ? 'ON' : 'OFF'}`)
-      .setDescription(updated.moodReactionsEnabled
-        ? 'When someone is pinged and the message has a mood keyword, bot uses mood emojis. Use `/listmoods` to see all keywords.'
-        : 'Mood reactions disabled. Bot uses your configured emojis.')], ephemeral: true });
+  // ── Role emojis ──
+  if (cmd === 'setrole') {
+    const role = interaction.options.getRole('role');
+    const emojis = many(interaction.options.getString('emojis'));
+    if (!emojis.length) return interaction.reply({ content: 'No valid emojis.', ephemeral: true });
+    setGuild(guild.id, { roleEmojis: { ...cfg.roleEmojis, [role.id]: emojis } });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`When a member of ${role} is pinged → ${emojis.map(disp).join(' ')}`)], ephemeral: true });
   }
-  if (commandName === 'toggleautomood') {
-    const updated = setGuild(guild.id, { autoMoodEnabled: !cfg.autoMoodEnabled });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(updated.autoMoodEnabled ? 0x57F287 : 0xFEE75C)
-      .setTitle(`Auto Mood — ${updated.autoMoodEnabled ? 'ON' : 'OFF'}`)
-      .setDescription(updated.autoMoodEnabled
-        ? 'Bot will now react to ANY message that contains a mood keyword — no ping needed.'
-        : 'Auto mood off. Bot only uses mood reactions when someone is pinged.')], ephemeral: true });
+  if (cmd === 'delrole') {
+    const role = interaction.options.getRole('role');
+    const re = { ...cfg.roleEmojis };
+    delete re[role.id];
+    setGuild(guild.id, { roleEmojis: re });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`Role emoji config removed for ${role}.`)], ephemeral: true });
   }
-  if (commandName === 'listmoods') {
-    const rules = cfg.moodRules;
+  if (cmd === 'roles') {
+    const entries = Object.entries(cfg.roleEmojis);
+    if (!entries.length) return interaction.reply({ content: 'No role configs. Use `/setrole @role <emojis>`.', ephemeral: true });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Role Emojis').setDescription(entries.map(([id, em], i) => `${i + 1}. <@&${id}> → ${em.map(disp).join(' ')}`).join('\n'))], ephemeral: true });
+  }
+
+  // ── Mood ──
+  if (cmd === 'mood') {
+    const u = setGuild(guild.id, { mood: !cfg.mood });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(u.mood ? 0x57F287 : 0xFEE75C).setDescription(`Mood on ping: **${u.mood ? 'ON' : 'OFF'}**.\n${u.mood ? 'Bot uses mood emojis when a keyword appears in a ping message.' : 'Using configured emojis.'}`)], ephemeral: true });
+  }
+  if (cmd === 'automood') {
+    const u = setGuild(guild.id, { automood: !cfg.automood });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(u.automood ? 0x57F287 : 0xFEE75C).setDescription(`Auto mood: **${u.automood ? 'ON' : 'OFF'}**.\n${u.automood ? 'Bot reacts to any message with a mood keyword — no ping needed.' : 'Auto mood off.'}`)], ephemeral: true });
+  }
+  if (cmd === 'moods') {
+    const rules = cfg.moods;
     const lines = rules.map((r, i) => `${i + 1}. \`${r.keyword}\` → ${r.emojis.join(' ')}`).join('\n');
     const chunks = [];
-    let current = '';
+    let cur = '';
     for (const line of lines.split('\n')) {
-      if ((current + '\n' + line).length > 1000) { chunks.push(current); current = line; }
-      else current = current ? current + '\n' + line : line;
+      if ((cur + '\n' + line).length > 1000) { chunks.push(cur); cur = line; } else cur = cur ? cur + '\n' + line : line;
     }
-    if (current) chunks.push(current);
-    const embed = new EmbedBuilder().setColor(0x5865F2).setTitle(`Mood Rules (${rules.length})`)
-      .setDescription(chunks[0] || 'No rules.')
-      .setFooter({ text: 'Use /addmood to add custom rules, /editmood to change emojis, /removemood to delete.' });
-    if (chunks[1]) embed.addFields({ name: '(continued)', value: chunks[1] });
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    if (cur) chunks.push(cur);
+    const e = new EmbedBuilder().setColor(0x5865F2).setTitle(`Mood Rules (${rules.length})`).setDescription(chunks[0] || 'No rules.').setFooter({ text: 'Use /moodadd, /moodedit, /mooddel to manage.' });
+    if (chunks[1]) e.addFields({ name: '...continued', value: chunks[1] });
+    return interaction.reply({ embeds: [e], ephemeral: true });
   }
-  if (commandName === 'addmood') {
-    const keyword = interaction.options.getString('keyword').toLowerCase().trim();
-    const emojis = parseManyEmojis(interaction.options.getString('emojis'));
-    if (!emojis.length) return interaction.reply({ content: 'No valid emojis found.', ephemeral: true });
-    if (cfg.moodRules.find(r => r.keyword === keyword)) return interaction.reply({ content: `A rule for \`${keyword}\` already exists. Use \`/editmood\` to change it.`, ephemeral: true });
-    cfg.moodRules.push({ keyword, emojis });
-    setGuild(guild.id, { moodRules: cfg.moodRules });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Added mood rule: \`${keyword}\` → ${emojis.join(' ')}\n\nNow when a message contains "${keyword}", bot reacts with those emojis.`)], ephemeral: true });
+  if (cmd === 'moodadd') {
+    const kw = interaction.options.getString('keyword').toLowerCase().trim();
+    const emojis = many(interaction.options.getString('emojis'));
+    if (!emojis.length) return interaction.reply({ content: 'No valid emojis.', ephemeral: true });
+    if (cfg.moods.find(r => r.keyword === kw)) return interaction.reply({ content: `Rule for \`${kw}\` exists. Use \`/moodedit\`.`, ephemeral: true });
+    cfg.moods.push({ keyword: kw, emojis });
+    setGuild(guild.id, { moods: cfg.moods });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Added: \`${kw}\` → ${emojis.join(' ')}`)], ephemeral: true });
   }
-  if (commandName === 'editmood') {
-    const keyword = interaction.options.getString('keyword').toLowerCase().trim();
-    const emojis = parseManyEmojis(interaction.options.getString('emojis'));
-    if (!emojis.length) return interaction.reply({ content: 'No valid emojis found.', ephemeral: true });
-    const idx = cfg.moodRules.findIndex(r => r.keyword === keyword);
-    if (idx === -1) return interaction.reply({ content: `No rule found for \`${keyword}\`. Use \`/listmoods\` to see all rules.`, ephemeral: true });
-    cfg.moodRules[idx].emojis = emojis;
-    setGuild(guild.id, { moodRules: cfg.moodRules });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Updated \`${keyword}\` → ${emojis.join(' ')}`)], ephemeral: true });
+  if (cmd === 'moodedit') {
+    const kw = interaction.options.getString('keyword').toLowerCase().trim();
+    const emojis = many(interaction.options.getString('emojis'));
+    if (!emojis.length) return interaction.reply({ content: 'No valid emojis.', ephemeral: true });
+    const idx = cfg.moods.findIndex(r => r.keyword === kw);
+    if (idx === -1) return interaction.reply({ content: `No rule for \`${kw}\`. Use \`/moods\` to see all.`, ephemeral: true });
+    cfg.moods[idx].emojis = emojis;
+    setGuild(guild.id, { moods: cfg.moods });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Updated \`${kw}\` → ${emojis.join(' ')}`)], ephemeral: true });
   }
-  if (commandName === 'removemood') {
-    const keyword = interaction.options.getString('keyword').toLowerCase().trim();
-    const before = cfg.moodRules.length;
-    cfg.moodRules = cfg.moodRules.filter(r => r.keyword !== keyword);
-    if (cfg.moodRules.length === before) return interaction.reply({ content: `No rule found for \`${keyword}\`. Use \`/listmoods\` to see all rules.`, ephemeral: true });
-    setGuild(guild.id, { moodRules: cfg.moodRules });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`Removed mood rule for \`${keyword}\`.`)], ephemeral: true });
+  if (cmd === 'mooddel') {
+    const kw = interaction.options.getString('keyword').toLowerCase().trim();
+    const before = cfg.moods.length;
+    cfg.moods = cfg.moods.filter(r => r.keyword !== kw);
+    if (cfg.moods.length === before) return interaction.reply({ content: `No rule for \`${kw}\`.`, ephemeral: true });
+    setGuild(guild.id, { moods: cfg.moods });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`Removed mood rule: \`${kw}\``)], ephemeral: true });
   }
-  if (commandName === 'resetmoods') {
-    setGuild(guild.id, { moodRules: JSON.parse(JSON.stringify(DEFAULT_MOODS)) });
+  if (cmd === 'moodreset') {
+    setGuild(guild.id, { moods: JSON.parse(JSON.stringify(DEFAULT_MOODS)) });
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Mood rules reset to **${DEFAULT_MOODS.length}** built-in defaults.`)], ephemeral: true });
   }
 
-  // Reaction roles
-  if (commandName === 'addreactionrole') {
-    const messageId = interaction.options.getString('message_id');
-    const emoji = parseOneEmoji(interaction.options.getString('emoji'));
+  // ── Reaction roles ──
+  if (cmd === 'rradd') {
+    const msgId = interaction.options.getString('message_id');
+    const emoji = one(interaction.options.getString('emoji'));
     const role = interaction.options.getRole('role');
     const channel = interaction.options.getChannel('channel') || interaction.channel;
-    if (!emoji) return interaction.reply({ content: 'No valid emoji found.', ephemeral: true });
-    let targetMessage;
-    try { targetMessage = await channel.messages.fetch(messageId); } catch { return interaction.reply({ content: `Could not find that message in ${channel}. Check the message ID.`, ephemeral: true }); }
-    if (cfg.reactionRoles.find(r => r.messageId === messageId && r.emoji === emoji && r.roleId === role.id)) return interaction.reply({ content: 'That reaction role already exists.', ephemeral: true });
-    cfg.reactionRoles.push({ messageId, channelId: channel.id, emoji, roleId: role.id });
+    if (!emoji) return interaction.reply({ content: 'No valid emoji.', ephemeral: true });
+    let msg;
+    try { msg = await channel.messages.fetch(msgId); } catch { return interaction.reply({ content: `Couldn't find that message in ${channel}.`, ephemeral: true }); }
+    if (cfg.reactionRoles.find(r => r.messageId === msgId && r.emoji === emoji && r.roleId === role.id)) return interaction.reply({ content: 'Already exists.', ephemeral: true });
+    cfg.reactionRoles.push({ messageId: msgId, channelId: channel.id, emoji, roleId: role.id });
     setGuild(guild.id, { reactionRoles: cfg.reactionRoles });
-    await targetMessage.react(emoji).catch(() => {});
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setTitle('Reaction Role Added')
-      .setDescription(`[Jump to message](https://discord.com/channels/${guild.id}/${channel.id}/${messageId})\nEmoji: ${emojiDisplay(emoji)} → Role: ${role}`)
-      .setFooter({ text: 'Bot reacted to the message. Users can now react to get the role.' })], ephemeral: true });
+    await msg.react(emoji).catch(() => {});
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setTitle('Reaction Role Added').setDescription(`[Jump](https://discord.com/channels/${guild.id}/${channel.id}/${msgId})\n${disp(emoji)} → ${role}`)], ephemeral: true });
   }
-  if (commandName === 'listreactionroles') {
-    if (!cfg.reactionRoles.length) return interaction.reply({ content: 'No reaction roles set up. Use `/addreactionrole` to create one.', ephemeral: true });
-    const lines = cfg.reactionRoles.map((r, i) => `**${i + 1}.** ${emojiDisplay(r.emoji)} → <@&${r.roleId}>\n   [message](https://discord.com/channels/${guild.id}/${r.channelId}/${r.messageId})`).join('\n\n');
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Reaction Roles').setDescription(lines)], ephemeral: true });
+  if (cmd === 'rrlist') {
+    if (!cfg.reactionRoles.length) return interaction.reply({ content: 'No reaction roles. Use `/rradd`.', ephemeral: true });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Reaction Roles').setDescription(cfg.reactionRoles.map((r, i) => `**${i + 1}.** ${disp(r.emoji)} → <@&${r.roleId}>\n[message](https://discord.com/channels/${guild.id}/${r.channelId}/${r.messageId})`).join('\n\n'))], ephemeral: true });
   }
-  if (commandName === 'removereactionrole') {
+  if (cmd === 'rrdel') {
     const num = interaction.options.getInteger('number');
-    if (num > cfg.reactionRoles.length) return interaction.reply({ content: `No reaction role #${num}.`, ephemeral: true });
-    const removed = cfg.reactionRoles.splice(num - 1, 1)[0];
+    if (num > cfg.reactionRoles.length) return interaction.reply({ content: `No #${num}.`, ephemeral: true });
+    const rem = cfg.reactionRoles.splice(num - 1, 1)[0];
     setGuild(guild.id, { reactionRoles: cfg.reactionRoles });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`Removed #${num}: ${emojiDisplay(removed.emoji)} → <@&${removed.roleId}>`)], ephemeral: true });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`Removed #${num}: ${disp(rem.emoji)} → <@&${rem.roleId}>`)], ephemeral: true });
   }
 
-  // Ghost ping
-  if (commandName === 'toggleghostping') {
-    const updated = setGuild(guild.id, { ghostPingEnabled: !cfg.ghostPingEnabled });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(updated.ghostPingEnabled ? 0x57F287 : 0xFEE75C)
-      .setTitle(`Ghost Ping Detector — ${updated.ghostPingEnabled ? 'ON' : 'OFF'}`)
-      .setDescription(updated.ghostPingEnabled ? 'Bot will now alert when someone deletes or edits a ping.' : 'Ghost ping detection disabled.')], ephemeral: true });
+  // ── Ghost ping ──
+  if (cmd === 'ghost') {
+    const u = setGuild(guild.id, { ghost: !cfg.ghost });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(u.ghost ? 0x57F287 : 0xFEE75C).setDescription(`Ghost ping detector: **${u.ghost ? 'ON' : 'OFF'}**`)], ephemeral: true });
   }
-  if (commandName === 'setghostchannel') {
-    const channel = interaction.options.getChannel('channel');
-    setGuild(guild.id, { ghostPingChannelId: channel.id });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Ghost ping alerts → ${channel}`)], ephemeral: true });
+  if (cmd === 'ghostlog') {
+    const ch = interaction.options.getChannel('channel');
+    setGuild(guild.id, { ghostLog: ch.id });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Ghost ping alerts → ${ch}`)], ephemeral: true });
   }
 
-  // Leaderboard
-  if (commandName === 'pingled') {
+  // ── Leaderboard ──
+  if (cmd === 'top') {
     const counts = Object.entries(cfg.pingCounts).sort(([, a], [, b]) => b - a).slice(0, 10);
-    if (!counts.length) return interaction.reply({ content: 'No pings tracked yet.', ephemeral: false });
+    if (!counts.length) return interaction.reply({ content: 'No pings tracked yet.' });
     const medals = ['🥇', '🥈', '🥉'];
-    const lines = counts.map(([id, count], i) => `${medals[i] || `**${i + 1}.**`} <@${id}> — **${count}** pings`).join('\n');
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFFD700).setTitle('📊 Ping Leaderboard').setDescription(lines).setTimestamp()] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFFD700).setTitle('📊 Ping Leaderboard').setDescription(counts.map(([id, n], i) => `${medals[i] || `**${i + 1}.**`} <@${id}> — **${n}** pings`).join('\n')).setTimestamp()] });
   }
-  if (commandName === 'pingcount') {
+  if (cmd === 'count') {
     const user = interaction.options.getUser('user') || interaction.user;
-    const count = cfg.pingCounts[user.id] || 0;
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setDescription(`${user} has been pinged **${count} times** in this server.`)] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setDescription(`${user} has been pinged **${cfg.pingCounts[user.id] || 0} times**.`)] });
   }
-  if (commandName === 'setmilestonechannel') {
-    const channel = interaction.options.getChannel('channel');
-    setGuild(guild.id, { pingMilestoneChannelId: channel.id });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Milestone announcements → ${channel}\nFires at: ${MILESTONES.join(', ')} pings.`)], ephemeral: true });
+  if (cmd === 'milestone') {
+    const ch = interaction.options.getChannel('channel');
+    setGuild(guild.id, { milestoneLog: ch.id });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Milestone announcements → ${ch}`)], ephemeral: true });
   }
-  if (commandName === 'resetpingcount') {
+  if (cmd === 'resetcount') {
     const user = interaction.options.getUser('user');
     cfg.pingCounts[user.id] = 0;
     setGuild(guild.id, { pingCounts: cfg.pingCounts });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`Ping count for ${user} reset to 0.`)], ephemeral: true });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`Ping count reset for ${user}.`)], ephemeral: true });
   }
 
-  // Cooldowns
-  if (commandName === 'setcooldown') {
+  // ── Cooldown ──
+  if (cmd === 'cooldown') {
     const user = interaction.options.getUser('user');
-    const seconds = interaction.options.getInteger('seconds');
-    cfg.pingCooldownSeconds[user.id] = seconds;
-    setGuild(guild.id, { pingCooldownSeconds: cfg.pingCooldownSeconds });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Cooldown for ${user}: **${seconds}s**. Bot reacts to their pings at most once every ${seconds}s.`)], ephemeral: true });
+    const sec = interaction.options.getInteger('seconds');
+    cfg.cooldowns[user.id] = sec;
+    setGuild(guild.id, { cooldowns: cfg.cooldowns });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Cooldown for ${user}: **${sec}s** between reactions.`)], ephemeral: true });
   }
-  if (commandName === 'removecooldown') {
+  if (cmd === 'nocooldown') {
     const user = interaction.options.getUser('user');
-    delete cfg.pingCooldownSeconds[user.id];
-    delete cfg.lastPingTime[user.id];
-    setGuild(guild.id, { pingCooldownSeconds: cfg.pingCooldownSeconds, lastPingTime: cfg.lastPingTime });
+    delete cfg.cooldowns[user.id];
+    delete cfg.lastPing[user.id];
+    setGuild(guild.id, { cooldowns: cfg.cooldowns, lastPing: cfg.lastPing });
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFEE75C).setDescription(`Cooldown removed for ${user}.`)], ephemeral: true });
   }
-  if (commandName === 'listcooldowns') {
-    const entries = Object.entries(cfg.pingCooldownSeconds);
+  if (cmd === 'cooldowns') {
+    const entries = Object.entries(cfg.cooldowns);
     if (!entries.length) return interaction.reply({ content: 'No cooldowns set.', ephemeral: true });
-    const lines = entries.map(([id, sec], i) => `${i + 1}. <@${id}> — every **${sec}s**`).join('\n');
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Ping Cooldowns').setDescription(lines)], ephemeral: true });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Cooldowns').setDescription(entries.map(([id, s], i) => `${i + 1}. <@${id}> — **${s}s**`).join('\n'))], ephemeral: true });
   }
 
-  // Shield
-  if (commandName === 'shield') {
+  // ── Shield ──
+  if (cmd === 'shield') {
     const user = interaction.options.getUser('user');
-    const list = new Set(cfg.shieldedUsers);
+    const list = new Set(cfg.shields);
     list.add(user.id);
-    setGuild(guild.id, { shieldedUsers: [...list] });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setTitle('User Shielded').setDescription(`${user} is protected. Bot will warn anyone who pings them.`)], ephemeral: true });
+    setGuild(guild.id, { shields: [...list] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`🛡️ ${user} is now protected.`)], ephemeral: true });
   }
-  if (commandName === 'unshield') {
+  if (cmd === 'unshield') {
     const user = interaction.options.getUser('user');
-    setGuild(guild.id, { shieldedUsers: cfg.shieldedUsers.filter(id => id !== user.id) });
+    setGuild(guild.id, { shields: cfg.shields.filter(id => id !== user.id) });
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFEE75C).setDescription(`Shield removed from ${user}.`)], ephemeral: true });
   }
-  if (commandName === 'listshields') {
-    const list = cfg.shieldedUsers.length ? cfg.shieldedUsers.map((id, i) => `${i + 1}. <@${id}>`).join('\n') : 'No shielded users.';
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Shielded Users').setDescription(list)], ephemeral: true });
+  if (cmd === 'shields') {
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Shielded Users').setDescription(cfg.shields.length ? cfg.shields.map((id, i) => `${i + 1}. <@${id}>`).join('\n') : 'None.')], ephemeral: true });
   }
-  if (commandName === 'setshieldchannel') {
-    const channel = interaction.options.getChannel('channel');
-    setGuild(guild.id, { shieldAlertChannelId: channel.id });
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Shield alerts → ${channel}`)], ephemeral: true });
+  if (cmd === 'shieldlog') {
+    const ch = interaction.options.getChannel('channel');
+    setGuild(guild.id, { shieldLog: ch.id });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Shield alerts → ${ch}`)], ephemeral: true });
+  }
+
+  // ── Block ──
+  if (cmd === 'block') {
+    const user = interaction.options.getUser('user');
+    const list = new Set(cfg.blocked);
+    list.add(user.id);
+    setGuild(guild.id, { blocked: [...list] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`🚫 ${user} is now blocked. Bot will not react to any pings sent by them.`)], ephemeral: true });
+  }
+  if (cmd === 'unblock') {
+    const user = interaction.options.getUser('user');
+    setGuild(guild.id, { blocked: cfg.blocked.filter(id => id !== user.id) });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`${user} unblocked.`)], ephemeral: true });
+  }
+  if (cmd === 'blocked') {
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('Blocked Users').setDescription(cfg.blocked.length ? cfg.blocked.map((id, i) => `${i + 1}. <@${id}>`).join('\n') : 'None.')], ephemeral: true });
+  }
+
+  // ── Hours ──
+  if (cmd === 'hours') {
+    const start = interaction.options.getInteger('start');
+    const end = interaction.options.getInteger('end');
+    setGuild(guild.id, { hoursStart: start, hoursEnd: end });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription(`Bot will only auto-react between **${start}:00 – ${end}:00 UTC**.\nUse \`/nohours\` to remove this restriction.`)], ephemeral: true });
+  }
+  if (cmd === 'nohours') {
+    setGuild(guild.id, { hoursStart: null, hoursEnd: null });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x57F287).setDescription('Time restriction removed. Bot reacts 24/7.')], ephemeral: true });
+  }
+
+  // ── Rain ──
+  if (cmd === 'rain') {
+    const emoji = one(interaction.options.getString('emoji'));
+    const count = interaction.options.getInteger('count');
+    if (!emoji) return interaction.reply({ content: 'No valid emoji.', ephemeral: true });
+    await interaction.reply({ content: `🌧️ Reacting to the last **${count}** messages...`, ephemeral: true });
+    try {
+      const messages = await interaction.channel.messages.fetch({ limit: count + 1 });
+      const targets = [...messages.values()].filter(m => !m.author.bot).slice(0, count);
+      for (const msg of targets) {
+        await msg.react(emoji).catch(() => {});
+        await new Promise(r => setTimeout(r, 300));
+      }
+    } catch (e) {
+      await interaction.editReply('Failed to fetch messages. Make sure I have Read Message History permission.').catch(() => {});
+    }
   }
 });
 
@@ -759,75 +753,71 @@ client.on('interactionCreate', async (interaction) => {
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
   const cfg = getGuild(message.guild.id);
-  if (!cfg.reactionsEnabled) return;
+  if (!cfg.on) return;
+  if (!inHours(cfg)) return;
+  if (cfg.blocked.includes(message.author.id)) return;
 
-  const mentionedIds = [...message.mentions.users.keys()];
-  const hasRolePing = message.mentions.roles.size > 0 || message.mentions.everyone;
-
-  // Auto mood — reacts to any message with a mood keyword (no ping needed)
-  if (cfg.autoMoodEnabled) {
-    const mood = getMoodEmojis(cfg.moodRules, message.content);
+  // Auto mood — any message, no ping needed
+  if (cfg.automood) {
+    const mood = moodMatch(cfg.moods, message.content);
     if (mood) {
-      for (const emoji of mood) await message.react(emoji).catch(() => {});
+      for (const e of mood) await message.react(e).catch(() => {});
       return;
     }
   }
 
+  const mentionedIds = [...message.mentions.users.keys()];
+  const hasRolePing = message.mentions.roles.size > 0 || message.mentions.everyone;
   if (!mentionedIds.length && !hasRolePing) return;
 
   for (const userId of mentionedIds) {
-    if (!checkCooldown(cfg, userId)) continue;
-    const emojis = pickEmojis(cfg, userId, message.content);
+    if (!canReact(cfg, userId)) continue;
+    let memberRoles = null;
+    try {
+      const member = await message.guild.members.fetch(userId);
+      memberRoles = [...member.roles.cache.keys()];
+    } catch {}
+    const emojis = pickEmojis(cfg, userId, memberRoles, message.content);
     if (emojis.length) {
-      for (const emoji of emojis) await message.react(emoji).catch(() => {});
-      updateCooldown(cfg, message.guild.id, userId);
+      for (const e of emojis) await message.react(e).catch(() => {});
+      stampCooldown(cfg, message.guild.id, userId);
     }
-    await incrementPingCount(cfg, message.guild.id, message.guild, userId);
-    if (cfg.shieldedUsers.includes(userId)) {
-      const alertCh = cfg.shieldAlertChannelId ? message.guild.channels.cache.get(cfg.shieldAlertChannelId) : message.channel;
-      if (alertCh) await alertCh.send({ embeds: [new EmbedBuilder().setColor(0xED4245).setTitle('🛡️ Shield Alert').setDescription(`${message.author} — <@${userId}> is a protected user.`).setTimestamp()] }).catch(() => {});
+    await trackPing(cfg, message.guild.id, message.guild, userId);
+    if (cfg.shields.includes(userId)) {
+      const ch = cfg.shieldLog ? message.guild.channels.cache.get(cfg.shieldLog) : message.channel;
+      if (ch) await ch.send({ embeds: [new EmbedBuilder().setColor(0xED4245).setTitle('🛡️ Shield Alert').setDescription(`${message.author} pinged <@${userId}> who is a protected user.`).setTimestamp()] }).catch(() => {});
     }
   }
 
-  if (!mentionedIds.length && hasRolePing && cfg.defaultReactions.length) {
-    const emojis = cfg.randomMode ? [cfg.defaultReactions[Math.floor(Math.random() * cfg.defaultReactions.length)]] : cfg.defaultReactions;
-    for (const emoji of emojis) await message.react(emoji).catch(() => {});
+  if (!mentionedIds.length && hasRolePing && cfg.defaultEmojis.length) {
+    const pool = cfg.defaultEmojis;
+    const emojis = cfg.random ? [pool[Math.floor(Math.random() * pool.length)]] : pool;
+    for (const e of emojis) await message.react(e).catch(() => {});
   }
 });
 
-// ── Ghost ping: deleted ───────────────────────────────────────────────────────
+// ── Ghost ping ────────────────────────────────────────────────────────────────
 client.on('messageDelete', async (message) => {
   if (!message.guild || message.author?.bot) return;
   const cfg = getGuild(message.guild.id);
-  if (!cfg.ghostPingEnabled) return;
-  const hasPing = message.mentions?.users?.size > 0 || message.mentions?.roles?.size > 0;
-  if (!hasPing) return;
-  const alertCh = cfg.ghostPingChannelId ? message.guild.channels.cache.get(cfg.ghostPingChannelId) : message.channel;
-  if (!alertCh) return;
+  if (!cfg.ghost) return;
+  if (!message.mentions?.users?.size && !message.mentions?.roles?.size) return;
+  const ch = cfg.ghostLog ? message.guild.channels.cache.get(cfg.ghostLog) : message.channel;
+  if (!ch) return;
   const pinged = message.mentions.users.map(u => `${u}`).join(', ') || 'a role';
-  await alertCh.send({ embeds: [new EmbedBuilder().setColor(0xFF6B6B).setTitle('👻 Ghost Ping Detected')
-    .setDescription(`**${message.author?.tag || 'Someone'}** deleted a message that pinged ${pinged}.`)
-    .addFields({ name: 'Original Message', value: message.content ? `"${message.content.slice(0, 300)}"` : '*(no content)*' })
-    .setTimestamp()] }).catch(() => {});
+  await ch.send({ embeds: [new EmbedBuilder().setColor(0xFF6B6B).setTitle('👻 Ghost Ping — Deleted').setDescription(`**${message.author?.tag}** deleted a ping to ${pinged}.`).addFields({ name: 'Message', value: message.content ? `"${message.content.slice(0, 300)}"` : '*(empty)*' }).setTimestamp()] }).catch(() => {});
 });
-
-// ── Ghost ping: edited ────────────────────────────────────────────────────────
-client.on('messageUpdate', async (oldMessage, newMessage) => {
-  if (!oldMessage.guild || oldMessage.author?.bot) return;
-  const cfg = getGuild(oldMessage.guild.id);
-  if (!cfg.ghostPingEnabled) return;
-  const hadPing = oldMessage.mentions?.users?.size > 0 || oldMessage.mentions?.roles?.size > 0;
-  const hasPing = newMessage.mentions?.users?.size > 0 || newMessage.mentions?.roles?.size > 0;
-  if (!hadPing || hasPing) return;
-  const alertCh = cfg.ghostPingChannelId ? oldMessage.guild.channels.cache.get(cfg.ghostPingChannelId) : oldMessage.channel;
-  if (!alertCh) return;
-  const pinged = oldMessage.mentions.users.map(u => `${u}`).join(', ') || 'a role';
-  await alertCh.send({ embeds: [new EmbedBuilder().setColor(0xFF6B6B).setTitle('👻 Ghost Ping (Edited)')
-    .setDescription(`**${oldMessage.author?.tag}** edited a message to remove a ping to ${pinged}.`)
-    .addFields(
-      { name: 'Before', value: oldMessage.content ? `"${oldMessage.content.slice(0, 200)}"` : '*(unknown)*' },
-      { name: 'After', value: newMessage.content ? `"${newMessage.content.slice(0, 200)}"` : '*(empty)*' },
-    ).setTimestamp()] }).catch(() => {});
+client.on('messageUpdate', async (old, nw) => {
+  if (!old.guild || old.author?.bot) return;
+  const cfg = getGuild(old.guild.id);
+  if (!cfg.ghost) return;
+  const had = old.mentions?.users?.size > 0 || old.mentions?.roles?.size > 0;
+  const has = nw.mentions?.users?.size > 0 || nw.mentions?.roles?.size > 0;
+  if (!had || has) return;
+  const ch = cfg.ghostLog ? old.guild.channels.cache.get(cfg.ghostLog) : old.channel;
+  if (!ch) return;
+  const pinged = old.mentions.users.map(u => `${u}`).join(', ') || 'a role';
+  await ch.send({ embeds: [new EmbedBuilder().setColor(0xFF6B6B).setTitle('👻 Ghost Ping — Edited').setDescription(`**${old.author?.tag}** edited out a ping to ${pinged}.`).addFields({ name: 'Before', value: old.content?.slice(0, 200) || '*(unknown)*' }, { name: 'After', value: nw.content?.slice(0, 200) || '*(empty)*' }).setTimestamp()] }).catch(() => {});
 });
 
 // ── Reaction roles ────────────────────────────────────────────────────────────
@@ -837,21 +827,18 @@ client.on('messageReactionAdd', async (reaction, user) => {
   const guild = reaction.message.guild;
   if (!guild) return;
   const cfg = getGuild(guild.id);
-  const key = emojiKey(reaction.emoji);
-  const match = cfg.reactionRoles.find(r => r.messageId === reaction.message.id && r.emoji === key);
+  const match = cfg.reactionRoles.find(r => r.messageId === reaction.message.id && r.emoji === ekey(reaction.emoji));
   if (!match) return;
   const member = await guild.members.fetch(user.id).catch(() => null);
   if (member) await member.roles.add(match.roleId).catch(() => {});
 });
-
 client.on('messageReactionRemove', async (reaction, user) => {
   if (user.bot) return;
   if (reaction.partial) { try { await reaction.fetch(); } catch { return; } }
   const guild = reaction.message.guild;
   if (!guild) return;
   const cfg = getGuild(guild.id);
-  const key = emojiKey(reaction.emoji);
-  const match = cfg.reactionRoles.find(r => r.messageId === reaction.message.id && r.emoji === key);
+  const match = cfg.reactionRoles.find(r => r.messageId === reaction.message.id && r.emoji === ekey(reaction.emoji));
   if (!match) return;
   const member = await guild.members.fetch(user.id).catch(() => null);
   if (member) await member.roles.remove(match.roleId).catch(() => {});
