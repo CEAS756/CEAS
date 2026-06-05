@@ -312,7 +312,7 @@ async function registerCommands() {
 
 client.once('ready', async () => {
   console.log(`CEAS REACTION online as ${client.user.tag}`);
-  client.user.setActivity('Type /panel to configure', { type: 3 });
+  client.user.setActivity('.gg/benduk op', { type: 3 });
   await registerCommands();
 });
 
